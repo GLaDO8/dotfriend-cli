@@ -258,10 +258,10 @@ _generate_install_sh() {
 
   # Substitute basic placeholders
   local repo_name; repo_name="$(_selected_repo_name)"
-  sed -i.bak "s|{{DOTFILES_DIR}}|\${HOME}/${repo_name}|g" "$out"
   sed -i.bak "s|{{BACKUP_ROOT:-\${HOME}/.dotfiles-backup}}|${GEN_BACKUP_ROOT}|g" "$out"
   sed -i.bak "s|{{INSTALL_MAS:-true}}|true|g" "$out"
   sed -i.bak "s|{{BREW_UPGRADE:-true}}|true|g" "$out"
+  sed -i.bak "s|{{INSTALL_DOTFRIEND:-true}}|true|g" "$out"
   sed -i.bak "s|{{INSTALL_VALIDATE:-false}}|false|g" "$out"
   sed -i.bak "s|{{DRY_RUN:-false}}|false|g" "$out"
   rm -f "${out}.bak"
@@ -449,17 +449,22 @@ _generate_readme_md() {
     printf '```bash\n'
     printf './scripts/validate.sh --all\n'
     printf '```\n\n'
+    printf '%s\n\n' '`install.sh` also installs the `dotfriend` CLI when needed and registers this clone as the repo that `dotfriend sync` should maintain.'
     printf '%s\n\n' '`bootstrap.sh` is the first-run helper for a brand-new Mac when you want Homebrew/Xcode setup and repo cloning handled before `install.sh` runs.'
     printf '%s\n\n' "## Sync Back Into This Repo"
-    printf '%s\n\n' "Preview changes from your current machine:"
+    printf '%s\n\n' "Use dotfriend as the normal orchestrator for ongoing sync:"
+    printf '```bash\n'
+    printf 'dotfriend sync\n'
+    printf '```\n\n'
+    printf '%s\n\n' "If dotfriend is unavailable, this repo also includes a portable fallback sync script. Preview changes from your current machine:"
     printf '```bash\n'
     printf './scripts/backup.sh --dry-run\n'
     printf '```\n\n'
-    printf '%s\n\n' "Sync and auto-commit tracked changes:"
+    printf '%s\n\n' "Sync and auto-commit tracked changes locally:"
     printf '```bash\n'
     printf './scripts/backup.sh --commit\n'
     printf '```\n\n'
-    printf '%s\n\n' "This sync flow updates the generated repo content that dotfriend tracks, including your Brewfile, npm globals, tracked dotfiles/configs, selected agent configs, and VS Code/Cursor extension ID lists."
+    printf '%s\n\n' "These sync flows update the generated repo content that dotfriend tracks, including your Brewfile, npm globals, tracked dotfiles/configs, selected agent configs, and VS Code/Cursor extension ID lists."
     printf '%s\n\n' "## What Gets Restored"
     printf '%s\n' '- Homebrew taps, formulae, casks, and Mac App Store apps from `Brewfile`'
     printf '%s\n' '- Global npm packages from `npm-global.txt`'
@@ -470,6 +475,7 @@ _generate_readme_md() {
     printf '```bash\n'
     printf './install.sh\n'
     printf 'DRY_RUN=true ./install.sh\n'
+    printf 'dotfriend sync\n'
     printf './scripts/backup.sh --dry-run\n'
     printf './scripts/backup.sh --commit\n'
     printf './scripts/validate.sh --all\n'

@@ -11,8 +11,10 @@ set -euo pipefail
 
 INSTALL_MAS="{{INSTALL_MAS:-true}}"
 BREW_UPGRADE="{{BREW_UPGRADE:-true}}"
+INSTALL_DOTFRIEND="{{INSTALL_DOTFRIEND:-true}}"
 INSTALL_VALIDATE="{{INSTALL_VALIDATE:-false}}"
-DOTFILES_DIR="{{DOTFILES_DIR}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOTFILES_DIR="${DOTFILES_DIR:-${SCRIPT_DIR}}"
 BACKUP_ROOT="{{BACKUP_ROOT:-${HOME}/.dotfiles-backup}}"
 DRY_RUN="{{DRY_RUN:-false}}"
 
@@ -70,6 +72,14 @@ brew_prefix() {
   fi
 }
 
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  printf '%s' "$value"
+}
+
 # ─────────────────────────────────────────────────────────────
 # Phase 0: Sudo keepalive
 # ─────────────────────────────────────────────────────────────
@@ -121,6 +131,69 @@ phase_prerequisites() {
     soft_run brew update
     soft_run brew upgrade
   fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Phase 1.5: dotfriend CLI
+# ─────────────────────────────────────────────────────────────
+
+phase_dotfriend() {
+  log_step "Phase 1.5: dotfriend CLI"
+
+  if [[ "$INSTALL_DOTFRIEND" != "true" ]]; then
+    log_info "Skipping dotfriend install (INSTALL_DOTFRIEND=false)"
+    record_dotfriend_repo
+    return 0
+  fi
+
+  if command -v dotfriend >/dev/null 2>&1; then
+    log_ok "dotfriend already installed"
+    record_dotfriend_repo
+    return 0
+  fi
+
+  if ! command -v npm >/dev/null 2>&1; then
+    log_info "npm not found; installing Node.js so dotfriend can be installed"
+    soft_run brew install node || true
+  fi
+
+  if command -v npm >/dev/null 2>&1; then
+    soft_run npm install -g dotfriend || true
+  else
+    log_warn "npm still not found; dotfriend CLI was not installed"
+  fi
+
+  record_dotfriend_repo
+}
+
+record_dotfriend_repo() {
+  local cache_dir="${HOME}/.cache/dotfriend"
+  local cache_file="${cache_dir}/last-sync.json"
+  local remote_url=""
+  local branch=""
+  local installed_at
+  installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  if [[ -d "${DOTFILES_DIR}/.git" ]] && command -v git >/dev/null 2>&1; then
+    remote_url="$(git -C "$DOTFILES_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    branch="$(git -C "$DOTFILES_DIR" branch --show-current 2>/dev/null || true)"
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[dry-run] Would record ${DOTFILES_DIR} as the dotfriend sync repo"
+    return 0
+  fi
+
+  ensure_dir "$cache_dir"
+  printf '{"repo_dir":"%s","remote_url":"%s","branch":"%s","installed_at":"%s"}\n' \
+    "$(json_escape "$DOTFILES_DIR")" \
+    "$(json_escape "$remote_url")" \
+    "$(json_escape "$branch")" \
+    "$(json_escape "$installed_at")" > "$cache_file" || {
+      log_warn "Could not write dotfriend sync cache at ${cache_file}"
+      return 0
+    }
+  log_ok "Registered ${DOTFILES_DIR} for dotfriend sync"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -317,6 +390,7 @@ main() {
 
   start_sudo_keepalive
   phase_prerequisites
+  phase_dotfriend
   phase_configuration
   phase_apps
   phase_final

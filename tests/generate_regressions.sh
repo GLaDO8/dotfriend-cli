@@ -199,10 +199,22 @@ EOF
     ok "install.sh stays portable"
   fi
 
-  if grep -q '`bootstrap.sh`' "${repo_dir}/README.md" && grep -q '`Brewfile`' "${repo_dir}/README.md"; then
+  if grep -Fq 'DOTFILES_DIR="${DOTFILES_DIR:-${SCRIPT_DIR}}"' "${repo_dir}/install.sh"; then
+    ok "install.sh uses its clone as the managed repo"
+  else
+    ko "install.sh uses its clone as the managed repo" "DOTFILES_DIR does not default to script directory"
+  fi
+
+  if grep -q 'npm install -g dotfriend' "${repo_dir}/install.sh" && grep -q 'last-sync.json' "${repo_dir}/install.sh"; then
+    ok "install.sh installs dotfriend and records sync repo"
+  else
+    ko "install.sh installs dotfriend and records sync repo" "missing dotfriend install or cache registration"
+  fi
+
+  if grep -q '`bootstrap.sh`' "${repo_dir}/README.md" && grep -q '`Brewfile`' "${repo_dir}/README.md" && grep -q 'dotfriend sync' "${repo_dir}/README.md"; then
     ok "generated readme keeps literal markdown command names"
   else
-    ko "generated readme keeps literal markdown command names" "missing literal markdown backticks"
+    ko "generated readme keeps literal markdown command names" "missing literal markdown backticks or dotfriend sync guidance"
   fi
 
   if grep -q "DOTFILES_DIR=\"\${HOME}/work-mac\"" "${repo_dir}/bootstrap.sh"; then

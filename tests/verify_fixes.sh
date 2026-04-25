@@ -87,6 +87,7 @@ if [[ "$DUPES" == "0" ]]; then ok "zero duplicates"; else ko "duplicates" "$DUPE
 # ── 10. Generated script guards ──
 printf "\n10. Template guards\n"
 if grep -q 'rm -rf "\$dest" || {' templates/install.sh; then ok "install.sh symlink guarded"; else ko "symlink guard" "missing"; fi
+if grep -q 'npm install -g dotfriend' templates/install.sh && grep -q 'last-sync.json' templates/install.sh; then ok "install.sh bootstraps dotfriend sync"; else ko "dotfriend install" "missing"; fi
 if grep -q 'git clone' templates/bootstrap.sh | grep -q '|| {' templates/bootstrap.sh; then
   ok "bootstrap.sh git clone guarded"
 else
@@ -134,6 +135,7 @@ if [[ -f "${TEST_DIR}/dotfiles_test/Brewfile" ]]; then ok "Brewfile created"; el
 
 # Check no remaining placeholders
 if ! grep -q '{{' "${TEST_DIR}/dotfiles_test/install.sh" 2>/dev/null; then ok "no placeholders in install.sh"; else ko "placeholders" "still in install.sh"; fi
+if grep -q 'npm install -g dotfriend' "${TEST_DIR}/dotfiles_test/install.sh" && grep -q 'last-sync.json' "${TEST_DIR}/dotfiles_test/install.sh"; then ok "generated install.sh registers dotfriend sync"; else ko "generated dotfriend sync registration" "missing"; fi
 
 # Syntax check generated scripts
 if bash -n "${TEST_DIR}/dotfiles_test/install.sh" 2>/dev/null; then ok "generated install.sh syntax OK"; else ko "install.sh syntax" "error"; fi
