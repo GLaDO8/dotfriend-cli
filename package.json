@@ -1,6 +1,7 @@
 {
   "name": "dotfriend",
   "version": "0.3.1",
+  "packageManager": "pnpm@10.33.0",
   "description": "Generate and maintain your dotfiles repository",
   "bin": {
     "dotfriend": "bin/dotfriend.js"

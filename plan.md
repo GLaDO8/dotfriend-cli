@@ -1,0 +1,1 @@
+plans/dotfriend-cli-backend-contract-plan-2026-05-05.md
