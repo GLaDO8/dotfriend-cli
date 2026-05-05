@@ -346,35 +346,63 @@ sync_agents() {
   while IFS= read -r id; do
     [[ -z "$id" ]] && continue
 
-    canonical_dir="${HOME}/.${id}"
+    canonical_dir="$(jq -r --arg id "$id" '.agentic_tools[] | select(.id == $id) | .canonical_dir // empty' "$agents_file" 2>/dev/null || true)"
+    [[ -n "$canonical_dir" && "$canonical_dir" != "null" ]] || continue
+    canonical_dir="${canonical_dir/#\~/${HOME}}"
     repo_dir="${REPO_ROOT}/${id}"
 
     if [[ ! -d "$canonical_dir" ]]; then
       continue
     fi
 
-    if [[ "$DRY_RUN" == true ]]; then
-      printf "${C_DIM}   would sync: %s → %s${C_RESET}\n" "$canonical_dir/" "${repo_dir}/"
-      CHANGES_MADE=true
+    [[ "$DRY_RUN" == true ]] || mkdir -p "$repo_dir"
+
+    local important_files important_dirs
+    important_files="$(jq -r --arg id "$id" '.agentic_tools[] | select(.id == $id) | .important_files[]?' "$agents_file" 2>/dev/null || true)"
+    important_dirs="$(jq -r --arg id "$id" '.agentic_tools[] | select(.id == $id) | .important_dirs[]?' "$agents_file" 2>/dev/null || true)"
+
+    if [[ -z "$important_files" && -z "$important_dirs" ]]; then
+      if [[ "$DRY_RUN" == true ]]; then
+        printf "${C_DIM}   would rsync: %s → %s${C_RESET}\n" "$canonical_dir/" "${repo_dir}/"
+        CHANGES_MADE=true
+      else
+        mkdir -p "$repo_dir"
+        if command -v rsync >/dev/null 2>&1; then
+          if rsync -a --delete "$canonical_dir/" "${repo_dir}/"; then
+            CHANGES_MADE=true
+          fi
+        else
+          rm -rf "${repo_dir:?}" || true
+          if cp -R "$canonical_dir" "$repo_dir"; then
+            CHANGES_MADE=true
+          fi
+        fi
+      fi
+      log_ok "Synced agent: $id"
       continue
     fi
-
-    mkdir -p "$repo_dir"
 
     # Sync important files
     while IFS= read -r file; do
       [[ -z "$file" ]] && continue
       local src="${canonical_dir}/${file}"
-      if [[ -f "$src" ]]; then
+      if [[ -f "$src" && ! -L "$src" ]]; then
         copy_file "$src" "${repo_dir}/${file}"
+      elif [[ -L "$src" ]]; then
+        log_info "Skipping symlinked agent file: $src"
       fi
-    done < <(jq -r --arg id "$id" '.agentic_tools[] | select(.id == $id) | .important_files[]?' "$agents_file" 2>/dev/null || true)
+    done <<< "$important_files"
 
     # Sync important dirs
     while IFS= read -r dir; do
       [[ -z "$dir" ]] && continue
       local src="${canonical_dir}/${dir}"
-      if [[ -d "$src" ]]; then
+      if [[ -d "$src" && ! -L "$src" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+          printf "${C_DIM}   would rsync: %s → %s${C_RESET}\n" "$src/" "${repo_dir}/${dir}/"
+          CHANGES_MADE=true
+          continue
+        fi
         if command -v rsync >/dev/null 2>&1; then
           if rsync -a --delete "$src/" "${repo_dir:?}/${dir}/"; then
             CHANGES_MADE=true
@@ -385,11 +413,50 @@ sync_agents() {
             CHANGES_MADE=true
           fi
         fi
+      elif [[ -L "$src" ]]; then
+        log_info "Skipping symlinked agent dir: $src"
       fi
-    done < <(jq -r --arg id "$id" '.agentic_tools[] | select(.id == $id) | .important_dirs[]?' "$agents_file" 2>/dev/null || true)
+    done <<< "$important_dirs"
 
     log_ok "Synced agent: $id"
   done < <(selected_agent_ids)
+
+  local shared_src shared_dest
+  shared_src="${HOME}/.agents/skills"
+  shared_dest="${REPO_ROOT}/agents/skills"
+  if [[ -d "$shared_src" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      printf "${C_DIM}   would rsync: %s → %s${C_RESET}\n" "$shared_src/" "$shared_dest/"
+      CHANGES_MADE=true
+    else
+      mkdir -p "$shared_dest"
+      if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "$shared_src/" "$shared_dest/" && CHANGES_MADE=true
+      else
+        rm -rf "${shared_dest:?}" || true
+        cp -R "$shared_src" "$shared_dest" && CHANGES_MADE=true
+      fi
+      log_ok "Synced shared agent skills"
+    fi
+  fi
+
+  shared_src="${HOME}/.agents/agent-docs"
+  shared_dest="${REPO_ROOT}/agents/agent-docs"
+  if [[ -d "$shared_src" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      printf "${C_DIM}   would rsync: %s → %s${C_RESET}\n" "$shared_src/" "$shared_dest/"
+      CHANGES_MADE=true
+    else
+      mkdir -p "$shared_dest"
+      if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "$shared_src/" "$shared_dest/" && CHANGES_MADE=true
+      else
+        rm -rf "${shared_dest:?}" || true
+        cp -R "$shared_src" "$shared_dest" && CHANGES_MADE=true
+      fi
+      log_ok "Synced shared agent docs"
+    fi
+  fi
 }
 
 # ─────────────────────────────────────────────────────────────

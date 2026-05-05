@@ -21,6 +21,9 @@ source "${LIB_DIR}/common.sh"
 # shellcheck source=lib/bootstrap.sh
 source "${LIB_DIR}/bootstrap.sh"
 
+# shellcheck source=lib/api.sh
+source "${LIB_DIR}/api.sh"
+
 # ─────────────────────────────────────────────────────────────
 # Ensure cache directory exists
 # ─────────────────────────────────────────────────────────────
@@ -83,11 +86,45 @@ if [[ $# -eq 0 ]]; then
 fi
 
 ORIGINAL_ARGS=("$@")
-cmd="${1:-}"
-shift || true
+DOTFRIEND_API_JSON=false
+DOTFRIEND_API_EVENTS=false
+DOTFRIEND_NO_BOOTSTRAP=false
+DOTFRIEND_APPROVED=false
+
+cmd=""
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --json)
+      DOTFRIEND_API_JSON=true
+      ;;
+    --events)
+      DOTFRIEND_API_EVENTS=true
+      ;;
+    --no-bootstrap)
+      DOTFRIEND_NO_BOOTSTRAP=true
+      ;;
+    --approved)
+      DOTFRIEND_APPROVED=true
+      ;;
+    *)
+      if [[ -z "$cmd" ]]; then
+        cmd="$arg"
+      else
+        args+=("$arg")
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$cmd" ]]; then
+  cmd="${1:-}"
+  shift || true
+  args=("$@")
+fi
 
 if [[ "${cmd}" == "start" || "${cmd}" == "sync" ]]; then
-  if [[ "${DOTFRIEND_RUNTIME_BOOTSTRAPPED:-false}" != "true" ]]; then
+  if [[ "${DOTFRIEND_NO_BOOTSTRAP}" != "true" && "${DOTFRIEND_RUNTIME_BOOTSTRAPPED:-false}" != "true" ]]; then
     bootstrap_runtime
     exec env DOTFRIEND_RUNTIME_BOOTSTRAPPED=true "$0" "${ORIGINAL_ARGS[@]}"
   fi
@@ -96,7 +133,7 @@ fi
 case "${cmd}" in
   start)
     dry_run=false
-    for arg in "$@"; do
+    for arg in "${args[@]}"; do
       case "$arg" in
         --dry-run) dry_run=true ;;
       esac
@@ -114,7 +151,17 @@ case "${cmd}" in
   sync)
     # shellcheck source=lib/sync.sh
     source "${LIB_DIR}/sync.sh"
-    cmd_sync "$@"
+    cmd_sync "${args[@]}"
+    ;;
+
+  preflight)
+    if [[ "${DOTFRIEND_API_JSON}" != "true" ]]; then
+      api_fail "preflight" "json_required" "Use dotfriend preflight --json."
+      exit 2
+    fi
+    # shellcheck source=lib/preflight.sh
+    source "${LIB_DIR}/preflight.sh"
+    preflight_run_json
     ;;
 
   --help|-h)

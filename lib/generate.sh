@@ -10,6 +10,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck source=gum.sh
 source "$(dirname "${BASH_SOURCE[0]}")/gum.sh"
 
+# shellcheck source=manifest.sh
+source "$(dirname "${BASH_SOURCE[0]}")/manifest.sh"
+
 # ─────────────────────────────────────────────────────────────
 # Paths
 # ─────────────────────────────────────────────────────────────
@@ -424,6 +427,12 @@ _generate_repo_metadata() {
   cp "$SELECTIONS_FILE" "${metadata_dir}/selections.json"
 
   log_ok "Repo metadata generated"
+}
+
+_generate_restore_manifest() {
+  log_info "Generating restore manifest..."
+  manifest_write_for_generated_repo "$GEN_DIR" "$SELECTIONS_FILE" "${SCRIPT_DIR}/agent-tools.json"
+  log_ok "Restore manifest generated"
 }
 
 _generate_readme_md() {
@@ -1063,6 +1072,7 @@ generate_repo() {
   _copy_agent_configs
   _copy_dock
   _copy_scripts
+  _generate_restore_manifest
 
   _init_git
   _github_push
