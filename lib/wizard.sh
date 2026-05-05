@@ -145,7 +145,7 @@ _write_selections_json() {
       [[ "$first" == true ]] || json+=","
       first=false
       json+="\"$(json_escape "$cfg")\""
-    done < <(jq -r '(.config_dirs // "") | split("\n")[] | select(length > 0)' "$DISCOVERY_CACHE" 2>/dev/null || true)
+    done < <(discovery_cache_lines config_dirs "$DISCOVERY_CACHE")
   fi
   json+="],"
 
@@ -182,6 +182,64 @@ _write_selections_json() {
   json+="}"
 
   printf '%s\n' "$json" > "$file"
+}
+
+discovery_cache_lines() {
+  local field="$1" cache_file="${2:-$DISCOVERY_CACHE}"
+  [[ -f "$cache_file" ]] || return 0
+  case "$field" in
+    apps)
+      jq -r '
+        if (.schema_version // 1) == 2 then
+          .apps[]? | [.name, (.restore_ref // (if .source == "cask" then "cask:\(.cask)" else .source end))] | @tsv | gsub("\t"; "|")
+        else
+          (.apps // "") | split("\n")[] | select(length > 0)
+        end
+      ' "$cache_file" 2>/dev/null || true
+      ;;
+    agents)
+      jq -r '
+        if (.schema_version // 1) == 2 then
+          .agents[]? | [.id, .name, (.config_dir // ""), (.status // "missing"), ((.skill_count // 0) | tostring)] | @tsv | gsub("\t"; "|")
+        else
+          (.agents // "") | split("\n")[] | select(length > 0)
+        end
+      ' "$cache_file" 2>/dev/null || true
+      ;;
+    formulae)
+      jq -r '
+        if (.schema_version // 1) == 2 then
+          .formulae[]? | [.name, (.description // "")] | @tsv | gsub("\t"; "|")
+        else
+          (.formulae // "") | split("\n")[] | select(length > 0)
+        end
+      ' "$cache_file" 2>/dev/null || true
+      ;;
+    taps)
+      jq -r 'if (.schema_version // 1) == 2 then .taps[]? | .name // empty else (.taps // "") | split("\n")[] | select(length > 0) end' "$cache_file" 2>/dev/null || true
+      ;;
+    npm_globals)
+      jq -r 'if (.schema_version // 1) == 2 then .npm_globals[]? | if .version then "\(.name)@\(.version)" else .name end else (.npm_globals // "") | split("\n")[] | select(length > 0) end' "$cache_file" 2>/dev/null || true
+      ;;
+    dotfiles)
+      jq -r 'if (.schema_version // 1) == 2 then .dotfiles[]? | .path // empty else (.dotfiles // "") | split("\n")[] | select(length > 0) end' "$cache_file" 2>/dev/null || true
+      ;;
+    config_dirs)
+      jq -r 'if (.schema_version // 1) == 2 then .config_dirs[]? | .name // empty else (.config_dirs // "") | split("\n")[] | select(length > 0) end' "$cache_file" 2>/dev/null || true
+      ;;
+  esac
+}
+
+discovery_editor_settings_path() {
+  local editor="$1" cache_file="${2:-$DISCOVERY_CACHE}"
+  [[ -f "$cache_file" ]] || return 0
+  jq -r --arg editor "$editor" '
+    if (.schema_version // 1) == 2 then
+      .editors[$editor].settings_path // empty
+    else
+      .[$editor] // empty
+    end
+  ' "$cache_file" 2>/dev/null || true
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -259,7 +317,7 @@ _step1_apps() {
     casks+=("$cask")
     sources+=("$source")
     displays+=("$display")
-  done < <(jq -r '(.apps // "") | split("\n")[] | select(length > 0)' "$DISCOVERY_CACHE" 2>/dev/null || true)
+  done < <(discovery_cache_lines apps "$DISCOVERY_CACHE")
 
   if [[ ${#displays[@]} -eq 0 ]]; then
     log_info "No apps discovered. Skipping."
@@ -331,7 +389,7 @@ _step2_agents() {
     local skill_label="skills"
     [[ "$skill_count" -eq 1 ]] && skill_label="skill"
     displays+=("$aname ($skill_count $skill_label)")
-  done < <(jq -r '(.agents // "") | split("\n")[] | select(length > 0)' "$DISCOVERY_CACHE" 2>/dev/null || true)
+  done < <(discovery_cache_lines agents "$DISCOVERY_CACHE")
 
   if [[ ${#displays[@]} -eq 0 ]]; then
     log_info "No agentic tools discovered on this Mac. Skipping."
@@ -380,7 +438,7 @@ _step3_formulae() {
     [[ -z "$name" ]] && continue
     fnames+=("$name")
     displays+=("$name — ${desc:-No description}")
-  done < <(jq -r '(.formulae // "") | split("\n")[] | select(length > 0)' "$DISCOVERY_CACHE" 2>/dev/null || true)
+  done < <(discovery_cache_lines formulae "$DISCOVERY_CACHE")
 
   if [[ ${#displays[@]} -eq 0 ]]; then
     log_info "No formulae discovered. Skipping."
@@ -429,7 +487,7 @@ _step4_taps() {
   while IFS= read -r tap; do
     [[ -z "$tap" ]] && continue
     taps+=("$tap")
-  done < <(jq -r '(.taps // "") | split("\n")[] | select(length > 0)' "$DISCOVERY_CACHE" 2>/dev/null || true)
+  done < <(discovery_cache_lines taps "$DISCOVERY_CACHE")
 
   if [[ ${#taps[@]} -eq 0 ]]; then
     log_info "No taps discovered. Skipping."
@@ -470,7 +528,7 @@ _step5_npm() {
   while IFS= read -r pkg; do
     [[ -z "$pkg" ]] && continue
     packages+=("$pkg")
-  done < <(jq -r '(.npm_globals // "") | split("\n")[] | select(length > 0)' "$DISCOVERY_CACHE" 2>/dev/null || true)
+  done < <(discovery_cache_lines npm_globals "$DISCOVERY_CACHE")
 
   if [[ ${#packages[@]} -eq 0 ]]; then
     log_info "No npm global packages discovered. Skipping."
@@ -520,7 +578,7 @@ _step6_dotfiles() {
     esac
     paths+=("$path")
     displays+=("${category}: $path")
-  done < <(jq -r '(.dotfiles // "") | split("\n")[] | select(length > 0)' "$DISCOVERY_CACHE" 2>/dev/null | sort -t: -k1,1 -k2,2 || true)
+  done < <(discovery_cache_lines dotfiles "$DISCOVERY_CACHE" | sort -t: -k1,1 -k2,2 || true)
 
   if [[ ${#displays[@]} -eq 0 ]]; then
     log_info "No dotfiles discovered. Skipping."
@@ -564,8 +622,8 @@ _step7_editors() {
 
   if [[ -f "$DISCOVERY_CACHE" ]]; then
     local vscode_str cursor_str
-    vscode_str="$(jq -r '.vscode // empty' "$DISCOVERY_CACHE" 2>/dev/null || true)"
-    cursor_str="$(jq -r '.cursor // empty' "$DISCOVERY_CACHE" 2>/dev/null || true)"
+    vscode_str="$(discovery_editor_settings_path vscode "$DISCOVERY_CACHE")"
+    cursor_str="$(discovery_editor_settings_path cursor "$DISCOVERY_CACHE")"
     [[ -n "$vscode_str" && "$vscode_str" != "settings:missing" ]] && has_vscode=true
     [[ -n "$cursor_str" && "$cursor_str" != "settings:missing" ]] && has_cursor=true
   fi

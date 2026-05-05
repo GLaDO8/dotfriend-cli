@@ -611,6 +611,103 @@ discover_dock() {
 # Orchestration
 # ─────────────────────────────────────────────────────────────
 
+_discovery_file_json_array() {
+  local file="$1" jq_filter="$2"
+  if [[ -f "$file" ]]; then
+    jq -R -s "$jq_filter" "$file"
+  else
+    jq -n '[]'
+  fi
+}
+
+_discovery_editor_json() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    jq -R -s '
+      split("\n") as $lines |
+      ($lines[0] // "") as $settings |
+      {
+        settings_path: (if ($settings | startswith("settings:")) then ($settings | sub("^settings:"; "") | select(. != "missing") // "") else "" end),
+        extensions: ($lines[1:] | map(select(length > 0 and . != "extensions:")))
+      }
+    ' "$file"
+  else
+    jq -n '{settings_path:"", extensions:[]}'
+  fi
+}
+
+write_discovery_v2() {
+  local tmpdir="$1" cache_file="$2"
+  if ! command -v jq >/dev/null 2>&1; then
+    log_error "jq is required to write structured discovery cache."
+    return 1
+  fi
+
+  local apps_json formulae_json casks_json taps_json npm_json agents_json dotfiles_json config_dirs_json vscode_json cursor_json dock_json
+  apps_json="$(_discovery_file_json_array "$tmpdir/apps.txt" '
+    split("\n") | map(select(length > 0)) | map(
+      split("|") as $p |
+      ($p[1] // "") as $raw |
+      {
+        name: $p[0],
+        path: "",
+        cask: (if $raw | startswith("cask:") then ($raw | sub("^cask:"; "")) else "" end),
+        source: (
+          if $raw | startswith("cask:") then "cask"
+          elif $raw | startswith("mas:") then "mas"
+          elif $raw | startswith("appstore:") then "appstore"
+          elif $raw == "manual" then "manual"
+          else "unknown" end
+        ),
+        restore_ref: $raw
+      }
+    )
+  ')"
+  formulae_json="$(_discovery_file_json_array "$tmpdir/formulae.txt" 'split("\n") | map(select(length > 0)) | map(split("|") as $p | {name:$p[0], description:($p[1] // "")})')"
+  casks_json="$(_discovery_file_json_array "$tmpdir/casks.txt" 'split("\n") | map(select(length > 0)) | map({token:., name:.})')"
+  taps_json="$(_discovery_file_json_array "$tmpdir/taps.txt" 'split("\n") | map(select(length > 0)) | map({name:.})')"
+  npm_json="$(_discovery_file_json_array "$tmpdir/npm_globals.txt" 'split("\n") | map(select(length > 0)) | map(capture("^(?<name>.+)@(?<version>[^@]+)$")? // {name:., version:""})')"
+  agents_json="$(_discovery_file_json_array "$tmpdir/agents.txt" '
+    split("\n") | map(select(length > 0)) | map(
+      split("|") as $p |
+      {id:$p[0], name:($p[1] // ""), config_dir:($p[2] // ""), status:($p[3] // "missing"), skill_count:(($p[4] // "0") | tonumber? // 0)}
+    )
+  ')"
+  dotfiles_json="$(_discovery_file_json_array "$tmpdir/dotfiles.txt" 'split("\n") | map(select(length > 0)) | map({path:., status:"found"})')"
+  config_dirs_json="$(_discovery_file_json_array "$tmpdir/config_dirs.txt" 'split("\n") | map(select(length > 0)) | map({name:., path:("~/.config/" + .), status:"found"})')"
+  vscode_json="$(_discovery_editor_json "$tmpdir/vscode.txt")"
+  cursor_json="$(_discovery_editor_json "$tmpdir/cursor.txt")"
+  dock_json="$(_discovery_file_json_array "$tmpdir/dock.txt" 'split("\n") | map(select(length > 0)) | {apps:.}')"
+
+  jq -n \
+    --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --argjson apps "$apps_json" \
+    --argjson formulae "$formulae_json" \
+    --argjson casks "$casks_json" \
+    --argjson taps "$taps_json" \
+    --argjson npm_globals "$npm_json" \
+    --argjson agents "$agents_json" \
+    --argjson dotfiles "$dotfiles_json" \
+    --argjson config_dirs "$config_dirs_json" \
+    --argjson vscode "$vscode_json" \
+    --argjson cursor "$cursor_json" \
+    --argjson dock "$dock_json" \
+    '{
+      schema_version: 2,
+      generated_at: $generated_at,
+      apps: $apps,
+      formulae: $formulae,
+      casks: $casks,
+      taps: $taps,
+      npm_globals: $npm_globals,
+      agents: $agents,
+      dotfiles: $dotfiles,
+      config_dirs: $config_dirs,
+      editors: {vscode: $vscode, cursor: $cursor},
+      dock: $dock
+    }' > "$cache_file"
+}
+
 # Run all discovery tasks in parallel, cache results to discovery.json,
 # and provide TUI feedback via gum_spin.
 run_discovery() {
@@ -676,33 +773,9 @@ run_discovery() {
     log_warn "Some discovery tasks finished with errors."
   fi
 
-  # Assemble the cache file from individual temp outputs
+  # Assemble the cache file from individual temp outputs.
   if command -v jq >/dev/null 2>&1; then
-    jq -n \
-      --arg apps "$(cat "$tmpdir/apps.txt" 2>/dev/null || true)" \
-      --arg formulae "$(cat "$tmpdir/formulae.txt" 2>/dev/null || true)" \
-      --arg casks "$(cat "$tmpdir/casks.txt" 2>/dev/null || true)" \
-      --arg taps "$(cat "$tmpdir/taps.txt" 2>/dev/null || true)" \
-      --arg npm_globals "$(cat "$tmpdir/npm_globals.txt" 2>/dev/null || true)" \
-      --arg agents "$(cat "$tmpdir/agents.txt" 2>/dev/null || true)" \
-      --arg dotfiles "$(cat "$tmpdir/dotfiles.txt" 2>/dev/null || true)" \
-      --arg config_dirs "$(cat "$tmpdir/config_dirs.txt" 2>/dev/null || true)" \
-      --arg vscode "$(cat "$tmpdir/vscode.txt" 2>/dev/null || true)" \
-      --arg cursor "$(cat "$tmpdir/cursor.txt" 2>/dev/null || true)" \
-      --arg dock "$(cat "$tmpdir/dock.txt" 2>/dev/null || true)" \
-      '{
-        apps: $apps,
-        formulae: $formulae,
-        casks: $casks,
-        taps: $taps,
-        npm_globals: $npm_globals,
-        agents: $agents,
-        dotfiles: $dotfiles,
-        config_dirs: $config_dirs,
-        vscode: $vscode,
-        cursor: $cursor,
-        dock: $dock
-      }' > "$cache_file"
+    write_discovery_v2 "$tmpdir" "$cache_file"
   else
     # Portable fallback without jq
     {
@@ -742,6 +815,49 @@ load_discovery() {
     return 1
   fi
 
+  if command -v jq >/dev/null 2>&1 && [[ "$(jq -r '.schema_version // 1' "$cache_file" 2>/dev/null || printf '1')" == "2" ]]; then
+    load_discovery_v2 "$cache_file"
+    return 0
+  fi
+
+  load_discovery_legacy "$cache_file"
+}
+
+load_discovery_v2() {
+  local cache_file="${1:-${DOTFRIEND_CACHE_DIR}/discovery.json}"
+  if [[ ! -f "$cache_file" ]]; then
+    log_warn "No discovery cache found. Run run_discovery first."
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    log_warn "jq is required to load structured discovery cache."
+    return 1
+  fi
+
+  DISCOVERY_APPS="$(jq -r '.apps[]? | [.name, .restore_ref] | @tsv | gsub("\t"; "|")' "$cache_file")"
+  DISCOVERY_FORMULAE="$(jq -r '.formulae[]? | [.name, (.description // "")] | @tsv | gsub("\t"; "|")' "$cache_file")"
+  DISCOVERY_CASKS="$(jq -r '.casks[]? | .token // .name // empty' "$cache_file")"
+  DISCOVERY_TAPS="$(jq -r '.taps[]? | .name // empty' "$cache_file")"
+  DISCOVERY_NPM_GLOBALS="$(jq -r '.npm_globals[]? | if .version then "\(.name)@\(.version)" else .name end' "$cache_file")"
+  DISCOVERY_AGENTS="$(jq -r '.agents[]? | [.id, .name, (.config_dir // ""), (.status // "missing"), ((.skill_count // 0) | tostring)] | @tsv | gsub("\t"; "|")' "$cache_file")"
+  DISCOVERY_DOTFILES="$(jq -r '.dotfiles[]? | .path // empty' "$cache_file")"
+  DISCOVERY_CONFIG_DIRS="$(jq -r '.config_dirs[]? | .name // empty' "$cache_file")"
+  DISCOVERY_VSCODE="$(jq -r '.editors.vscode as $v | "settings:\($v.settings_path // "")", ($v.extensions[]? // empty)' "$cache_file")"
+  DISCOVERY_CURSOR="$(jq -r '.editors.cursor as $v | "settings:\($v.settings_path // "")", ($v.extensions[]? // empty)' "$cache_file")"
+  DISCOVERY_DOCK="$(jq -r '.dock.apps[]? // empty' "$cache_file")"
+
+  export DISCOVERY_APPS DISCOVERY_FORMULAE DISCOVERY_CASKS DISCOVERY_TAPS \
+    DISCOVERY_NPM_GLOBALS DISCOVERY_AGENTS DISCOVERY_DOTFILES \
+    DISCOVERY_CONFIG_DIRS DISCOVERY_VSCODE DISCOVERY_CURSOR DISCOVERY_DOCK
+}
+
+load_discovery_legacy() {
+  local cache_file="${1:-${DOTFRIEND_CACHE_DIR}/discovery.json}"
+  if [[ ! -f "$cache_file" ]]; then
+    log_warn "No discovery cache found. Run run_discovery first."
+    return 1
+  fi
+
   if command -v jq >/dev/null 2>&1; then
     DISCOVERY_APPS="$(jq -r '.apps // empty' "$cache_file")"
     DISCOVERY_FORMULAE="$(jq -r '.formulae // empty' "$cache_file")"
@@ -771,4 +887,14 @@ load_discovery() {
   export DISCOVERY_APPS DISCOVERY_FORMULAE DISCOVERY_CASKS DISCOVERY_TAPS \
     DISCOVERY_NPM_GLOBALS DISCOVERY_AGENTS DISCOVERY_DOTFILES \
     DISCOVERY_CONFIG_DIRS DISCOVERY_VSCODE DISCOVERY_CURSOR DISCOVERY_DOCK
+}
+
+discovery_cache_data_json() {
+  local cache_file="${1:-${DOTFRIEND_CACHE_DIR}/discovery.json}"
+  if [[ ! -f "$cache_file" ]]; then
+    jq -n '{cache_path:"", discovery:null}'
+    return 0
+  fi
+  jq -n --arg cache_path "$cache_file" --slurpfile discovery "$cache_file" \
+    '{cache_path:$cache_path, discovery:$discovery[0]}'
 }

@@ -164,6 +164,54 @@ case "${cmd}" in
     preflight_run_json
     ;;
 
+  discover)
+    if [[ "${DOTFRIEND_API_JSON}" != "true" && "${DOTFRIEND_API_EVENTS}" != "true" ]]; then
+      api_fail "discover" "json_or_events_required" "Use dotfriend discover --json or dotfriend discover --events."
+      exit 2
+    fi
+    # shellcheck source=lib/discovery.sh
+    source "${LIB_DIR}/discovery.sh"
+    if [[ "${DOTFRIEND_API_EVENTS}" == "true" ]]; then
+      api_event "job_started" '{"job":"discover"}'
+      api_event "step_started" '{"step":"discovery","label":"Scanning system"}'
+      if run_discovery >&2; then
+        api_event "step_finished" '{"step":"discovery","status":"ok"}'
+        api_event "job_finished" '{"job":"discover","status":"ok"}'
+      else
+        api_event "error" '{"code":"discovery_failed","message":"Discovery failed."}'
+        api_event "job_finished" '{"job":"discover","status":"failed"}'
+        exit 1
+      fi
+    else
+      if run_discovery >&2; then
+        api_print_envelope "ok" "discover" "$(discovery_cache_data_json)"
+      else
+        api_fail "discover" "discovery_failed" "Discovery failed."
+        exit 1
+      fi
+    fi
+    ;;
+
+  status)
+    if [[ "${DOTFRIEND_API_JSON}" != "true" ]]; then
+      api_fail "status" "json_required" "Use dotfriend status --json."
+      exit 2
+    fi
+    # shellcheck source=lib/status.sh
+    source "${LIB_DIR}/status.sh"
+    status_print_json "status"
+    ;;
+
+  plan)
+    if [[ "${DOTFRIEND_API_JSON}" != "true" ]]; then
+      api_fail "plan" "json_required" "Use dotfriend plan --json."
+      exit 2
+    fi
+    # shellcheck source=lib/status.sh
+    source "${LIB_DIR}/status.sh"
+    status_print_json "plan"
+    ;;
+
   --help|-h)
     print_usage
     exit 0
