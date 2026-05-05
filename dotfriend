@@ -51,6 +51,7 @@ ${C_BOLD}${C_CYAN}dotfriend${C_RESET} — Generate and maintain your dotfiles re
 ${C_BOLD}Usage:${C_RESET}
   dotfriend start          Interactive first-run wizard
   dotfriend sync           Incremental sync
+  dotfriend agent status --json  Agent artifact backend status
   dotfriend --help         Show this help
   dotfriend --version      Show version
 
@@ -214,6 +215,12 @@ case "${cmd}" in
     # shellcheck source=lib/status.sh
     source "${LIB_DIR}/status.sh"
     status_print_json "plan"
+    ;;
+
+  agent)
+    # shellcheck source=lib/agent-artifacts.sh
+    source "${LIB_DIR}/agent-artifacts.sh"
+    agent_cmd "${args[@]}"
     ;;
 
   --help|-h)

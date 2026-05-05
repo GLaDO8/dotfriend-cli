@@ -20,6 +20,7 @@ CHECK_SHELL=false
 CHECK_GIT=false
 CHECK_AGENTS=false
 CHECK_NPM=false
+CHECK_DOTFRIEND=false
 
 # ─────────────────────────────────────────────────────────────
 # Parse arguments
@@ -39,6 +40,7 @@ else
       --git) CHECK_GIT=true ;;
       --agents) CHECK_AGENTS=true ;;
       --npm) CHECK_NPM=true ;;
+      --dotfriend) CHECK_DOTFRIEND=true ;;
       --all) CHECK_ALL=true ;;
     esac
   done
@@ -51,6 +53,7 @@ if [[ "$CHECK_ALL" == true ]]; then
   CHECK_GIT=true
   CHECK_AGENTS=true
   CHECK_NPM=true
+  CHECK_DOTFRIEND=true
 fi
 
 # ─────────────────────────────────────────────────────────────
@@ -109,6 +112,20 @@ record() {
 
 has_brew() { command -v brew >/dev/null 2>&1; }
 has_npm()  { command -v npm >/dev/null 2>&1; }
+
+json_ok() {
+  command -v jq >/dev/null 2>&1 && jq -e . "$1" >/dev/null 2>&1
+}
+
+is_safe_repo_path() {
+  local path="$1"
+  [[ -n "$path" && "$path" != /* && "$path" != *..* ]]
+}
+
+is_allowed_target_path() {
+  local path="$1"
+  [[ "$path" == "~/"* || "$path" == "\$HOME/"* || "$path" == "/Applications/"* || "$path" == "/Library/"* ]]
+}
 
 brew_is_installed() {
   local name="$1"
@@ -376,6 +393,72 @@ run_check_npm() {
 }
 
 # ─────────────────────────────────────────────────────────────
+# Check: dotfriend metadata
+# ─────────────────────────────────────────────────────────────
+
+run_check_dotfriend_metadata() {
+  local manifest="${REPO_ROOT}/.dotfriend/restore-manifest.json"
+  local artifacts="${REPO_ROOT}/.dotfriend/agent-artifacts.json"
+
+  if [[ ! -f "$manifest" ]]; then
+    record "restore manifest" "fail" ".dotfriend/restore-manifest.json is missing"
+    return
+  fi
+  if ! json_ok "$manifest"; then
+    record "restore manifest JSON" "fail" "restore-manifest.json is not valid JSON"
+    return
+  fi
+  if [[ "$(jq -r '.schema_version // empty' "$manifest")" != "1" ]]; then
+    record "restore manifest schema" "fail" "unsupported restore manifest schema"
+  else
+    record "restore manifest schema" "pass" "schema version 1"
+  fi
+
+  local bad_repo_path bad_target_path
+  bad_repo_path="$(jq -r '.items[]? | .repo_path // empty' "$manifest" | while IFS= read -r p; do [[ -z "$p" ]] && continue; is_safe_repo_path "$p" || { printf '%s\n' "$p"; break; }; done)"
+  if [[ -n "$bad_repo_path" ]]; then
+    record "restore repo paths" "fail" "unsafe repo_path: $bad_repo_path"
+  else
+    record "restore repo paths" "pass" "all repo paths are relative and safe"
+  fi
+
+  bad_target_path="$(jq -r '.items[]? | .target_path // empty' "$manifest" | while IFS= read -r p; do [[ -z "$p" ]] && continue; is_allowed_target_path "$p" || { printf '%s\n' "$p"; break; }; done)"
+  if [[ -n "$bad_target_path" ]]; then
+    record "restore target paths" "fail" "disallowed target_path: $bad_target_path"
+  else
+    record "restore target paths" "pass" "all target paths are allowed"
+  fi
+
+  if [[ -f "$artifacts" ]]; then
+    if ! json_ok "$artifacts"; then
+      record "agent artifacts JSON" "fail" "agent-artifacts.json is not valid JSON"
+    elif jq -e '
+      .schema_version == 1
+      and (.artifacts | type == "array")
+      and all(.artifacts[]?;
+        (.managed_by == "dotfriend")
+        and (.install.strategy | IN("managed_json_merge","managed_markdown_block","copy_managed_file","rsync_managed_dir","symlink_shared_store","manual_followup"))
+        and ((.source.repo_path // "") | startswith("/") | not)
+        and ((.source.repo_path // "") | contains("..") | not)
+      )
+    ' "$artifacts" >/dev/null; then
+      record "agent artifacts schema" "pass" "agent-artifacts.json is valid"
+    else
+      record "agent artifacts schema" "fail" "agent-artifacts.json failed validation"
+    fi
+  else
+    record "agent artifacts" "warn" ".dotfriend/agent-artifacts.json is missing"
+  fi
+
+  if find "$REPO_ROOT" -path "${REPO_ROOT}/.git" -prune -o -type f ! -name '*.dotfriend.bak' -print0 2>/dev/null |
+    xargs -0 grep -I -E '(BEGIN (RSA|OPENSSH|DSA|EC) PRIVATE KEY|ghp_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|GITHUB_TOKEN=[A-Za-z0-9_]{10,})' >/dev/null 2>&1; then
+    record "plaintext secrets" "fail" "obvious secret-looking value found"
+  else
+    record "plaintext secrets" "pass" "no obvious secret-looking values found"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────
 # Run checks
 # ─────────────────────────────────────────────────────────────
 
@@ -401,6 +484,10 @@ fi
 
 if [[ "$CHECK_NPM" == true ]]; then
   run_check_npm
+fi
+
+if [[ "$CHECK_DOTFRIEND" == true ]]; then
+  run_check_dotfriend_metadata
 fi
 
 # ─────────────────────────────────────────────────────────────

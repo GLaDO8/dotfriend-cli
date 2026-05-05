@@ -10,7 +10,9 @@ Built with bash and [Gum](https://github.com/charmbracelet/gum) (by Charm). No c
 
 **`dotfriend sync`** — Keeps your repo in sync with your machine. Detects new brew packages, changed config files, and updated agent settings. Optionally commits and pushes to GitHub.
 
-The generated repo includes a `bootstrap.sh` for brand-new Macs and an `install.sh` for full restoration — so you can go from a fresh macOS install to a fully configured machine in one command.
+The generated repo includes a `bootstrap.sh` for brand-new Macs and an `install.sh` for full restoration - so you can go from a fresh macOS install to a fully configured machine in one command.
+
+Generated repos also include `.dotfriend/restore-manifest.json`, `.dotfriend/agent-artifacts.json`, `.dotfriend/selections.json`, and `.dotfriend/agent-tools.json`. The restore manifest is the file/path contract for install, status, plan, sync, and backup. The agent artifact manifest is the contract for managed MCPs, instructions, rules, skills, commands, and shared stores.
 
 ## Installation
 
@@ -28,7 +30,7 @@ cd dotfriend
 
 Homebrew and Gum are installed automatically if missing.
 
-## Commands
+## Human commands
 
 | Command | Description |
 |---------|-------------|
@@ -40,6 +42,35 @@ Homebrew and Gum are installed automatically if missing.
 | `dotfriend sync --quick` | Non-interactive sync. Skip prompts and commit with a default message. |
 | `dotfriend --help` | Show usage. |
 | `dotfriend --version` | Show version. |
+
+## Backend/app-safe commands
+
+These commands are stable for app callers. `--json` prints one JSON object. `--events` prints newline-delimited JSON. Human logs go to stderr.
+
+| Command | Description |
+|---------|-------------|
+| `dotfriend preflight --json` | Report runtime readiness and planned bootstrap work without changing machine state. |
+| `dotfriend discover --json` | Run discovery and return the structured discovery cache. |
+| `dotfriend discover --events` | Stream discovery progress as JSON events. |
+| `dotfriend plan --json` | Report planned sync actions from the manifest. |
+| `dotfriend status --json` | Report generated repo, manifest, and drift status. |
+| `dotfriend sync --events` | Stream sync progress as JSON events. |
+| `dotfriend agent status --json` | Report selected agent tools, shared stores, artifact count, and drift. |
+| `dotfriend agent check --json` | Validate `.dotfriend/agent-artifacts.json`. |
+| `dotfriend agent sync --dry-run --json` | Preview managed agent artifact writes. |
+| `dotfriend agent suggest --json` | Detect local agent config candidates and return proposed artifacts without writing. |
+
+## Safety model
+
+dotfriend writes only generated repo content and selected restore targets. It does not intentionally back up secrets, chat history, caches, or logs.
+
+Managed agent config is partial by default:
+
+- Personal JSON entries are preserved.
+- Managed JSON entries carry `_managed_by: "dotfriend"` and `_dotfriend_artifact_id`.
+- Managed Markdown uses `<!-- dotfriend:start id="..." -->` and `<!-- dotfriend:end id="..." -->` markers.
+- Whole-file overwrite requires explicit `ownership: "dotfriend_full_file"`.
+- Backend write paths have a dry-run, status, or check command so an app can ask before applying changes.
 
 ## What gets backed up
 
