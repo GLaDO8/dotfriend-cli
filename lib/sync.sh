@@ -9,6 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 # shellcheck source=gum.sh
 source "${SCRIPT_DIR}/gum.sh"
+# shellcheck source=api.sh
+source "${SCRIPT_DIR}/api.sh"
+# shellcheck source=manifest.sh
+source "${SCRIPT_DIR}/manifest.sh"
 # shellcheck source=discovery.sh
 if [[ -f "${SCRIPT_DIR}/discovery.sh" ]]; then
   source "${SCRIPT_DIR}/discovery.sh"
@@ -22,6 +26,10 @@ DRY_RUN=false
 NO_COMMIT=false
 QUICK=false
 REPO_DIR=""
+SYNC_EVENTS="${DOTFRIEND_API_EVENTS:-false}"
+SYNC_DRIFT_JSON="[]"
+SYNC_WARNING_COUNT=0
+SYNC_CHANGE_COUNT=0
 
 # ─────────────────────────────────────────────────────────────
 # Repo resolution
@@ -59,6 +67,235 @@ _save_repo_cache() {
     jq -n --arg repo_dir "$REPO_DIR" --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{repo_dir: $repo_dir, last_sync: $timestamp}' > "$cache_file"
   else
     printf '{"repo_dir":"%s","last_sync":"%s"}\n' "$(json_escape "$REPO_DIR")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$cache_file"
+  fi
+}
+
+_sync_log() {
+  printf '%s\n' "$*" >&2
+}
+
+_sync_emit_event() {
+  local event="$1" payload="${2:-}"
+  [[ -n "$payload" ]] || payload="{}"
+  if [[ "$SYNC_EVENTS" == "true" ]]; then
+    api_event "$event" "$payload"
+  fi
+}
+
+_sync_warning() {
+  local code="$1" message="$2" details="${3:-}"
+  [[ -n "$details" ]] || details="{}"
+  ((SYNC_WARNING_COUNT++)) || true
+  if [[ "$SYNC_EVENTS" == "true" ]]; then
+    api_event "warning" "$(jq -cn --arg code "$code" --arg message "$message" --argjson details "$details" '{code:$code,message:$message,details:$details}')"
+  else
+    log_warn "$message"
+  fi
+}
+
+_sync_item_changed() {
+  local item_id="$1" change="$2" repo_path="$3" target_path="$4" code="$5"
+  ((SYNC_CHANGE_COUNT++)) || true
+  if [[ "$SYNC_EVENTS" == "true" ]]; then
+    api_event "item_changed" "$(jq -cn \
+      --arg item_id "$item_id" \
+      --arg change "$change" \
+      --arg repo_path "$repo_path" \
+      --arg target_path "$target_path" \
+      --arg code "$code" \
+      '{item_id:$item_id,change:$change,repo_path:$repo_path,target_path:$target_path,code:$code}')"
+  fi
+}
+
+_sync_add_drift() {
+  local code="$1" item_id="$2" repo_path="$3" target_path="$4" message="$5"
+  local drift_item
+  drift_item="$(jq -cn \
+    --arg code "$code" \
+    --arg item_id "$item_id" \
+    --arg repo_path "$repo_path" \
+    --arg target_path "$target_path" \
+    --arg message "$message" \
+    '{code:$code,item_id:$item_id,repo_path:$repo_path,target_path:$target_path,message:$message}')"
+  SYNC_DRIFT_JSON="$(jq -c --argjson item "$drift_item" '. + [$item]' <<< "$SYNC_DRIFT_JSON")"
+}
+
+_expand_home_path() {
+  local path="$1"
+  path="${path/#\~/$HOME}"
+  path="${path/#\$HOME/$HOME}"
+  printf '%s' "$path"
+}
+
+_load_restore_manifest() {
+  local manifest_file="${REPO_DIR}/.dotfriend/restore-manifest.json"
+  if [[ ! -f "$manifest_file" ]]; then
+    return 1
+  fi
+  if ! manifest_validate "$manifest_file" >/dev/null 2>&1; then
+    _sync_add_drift "manifest_schema_error" "" ".dotfriend/restore-manifest.json" "" "Restore manifest failed validation."
+    _sync_warning "manifest_schema_error" "Restore manifest failed validation." '{"path":".dotfriend/restore-manifest.json"}'
+    _sync_emit_event "error" '{"code":"manifest_schema_error","message":"Restore manifest failed validation."}'
+    return 2
+  fi
+  printf '%s' "$manifest_file"
+  return 0
+}
+
+_sync_manifest_file_item() {
+  local item_id="$1" repo_path="$2" target_path="$3"
+  local repo_source="${REPO_DIR}/${repo_path}"
+  local live_target
+  live_target="$(_expand_home_path "$target_path")"
+
+  if [[ ! -e "$live_target" ]]; then
+    _sync_add_drift "missing_live_target" "$item_id" "$repo_path" "$target_path" "Live target is missing."
+    _sync_item_changed "$item_id" "missing_live_target" "$repo_path" "$target_path" "missing_live_target"
+    return 0
+  fi
+
+  if [[ -d "$live_target" ]]; then
+    return 0
+  fi
+
+  if [[ ! -e "$repo_source" ]]; then
+    _sync_add_drift "missing_repo_source" "$item_id" "$repo_path" "$target_path" "Managed repo source is missing."
+    _sync_item_changed "$item_id" "add" "$repo_path" "$target_path" "missing_repo_source"
+    if [[ "$DRY_RUN" != true ]]; then
+      ensure_dir "$(dirname "$repo_source")"
+      cp -a "$live_target" "$repo_source"
+    fi
+    return 0
+  fi
+
+  if ! diff -q "$repo_source" "$live_target" >/dev/null 2>&1; then
+    _sync_add_drift "changed_live_file" "$item_id" "$repo_path" "$target_path" "Live file differs from repo source."
+    _sync_item_changed "$item_id" "update" "$repo_path" "$target_path" "changed_live_file"
+    if [[ "$DRY_RUN" != true ]]; then
+      ensure_dir "$(dirname "$repo_source")"
+      cp -a "$live_target" "$repo_source"
+    fi
+  fi
+}
+
+_sync_manifest_dir_item() {
+  local item_id="$1" repo_path="$2" target_path="$3"
+  local repo_source="${REPO_DIR}/${repo_path}"
+  local live_target
+  live_target="$(_expand_home_path "$target_path")"
+
+  if [[ ! -d "$live_target" ]]; then
+    _sync_add_drift "missing_live_target" "$item_id" "$repo_path" "$target_path" "Live target is missing."
+    _sync_item_changed "$item_id" "missing_live_target" "$repo_path" "$target_path" "missing_live_target"
+    return 0
+  fi
+
+  if [[ ! -d "$repo_source" ]]; then
+    _sync_add_drift "missing_repo_source" "$item_id" "$repo_path" "$target_path" "Managed repo source is missing."
+    _sync_item_changed "$item_id" "add" "$repo_path" "$target_path" "missing_repo_source"
+    if [[ "$DRY_RUN" != true ]]; then
+      ensure_dir "$repo_source"
+    fi
+  fi
+
+  while IFS= read -r -d '' live_file; do
+    local rel_path="${live_file#${live_target}/}"
+    local repo_file="${repo_source}/${rel_path}"
+    local event_repo_path="${repo_path}/${rel_path}"
+    local event_target_path="${target_path}/${rel_path}"
+
+    if [[ ! -e "$repo_file" ]]; then
+      _sync_add_drift "missing_repo_source" "$item_id" "$event_repo_path" "$event_target_path" "Managed repo source is missing."
+      _sync_item_changed "$item_id" "add" "$event_repo_path" "$event_target_path" "missing_repo_source"
+      if [[ "$DRY_RUN" != true ]]; then
+        ensure_dir "$(dirname "$repo_file")"
+        cp -a "$live_file" "$repo_file"
+      fi
+      continue
+    fi
+
+    if ! diff -q "$repo_file" "$live_file" >/dev/null 2>&1; then
+      _sync_add_drift "changed_live_file" "$item_id" "$event_repo_path" "$event_target_path" "Live file differs from repo source."
+      _sync_item_changed "$item_id" "update" "$event_repo_path" "$event_target_path" "changed_live_file"
+      if [[ "$DRY_RUN" != true ]]; then
+        cp -a "$live_file" "$repo_file"
+      fi
+    fi
+  done < <(find "$live_target" -type f -print0 2>/dev/null || true)
+
+  if [[ -d "$repo_source" ]]; then
+    while IFS= read -r -d '' repo_file; do
+      local rel_path="${repo_file#${repo_source}/}"
+      local live_file="${live_target}/${rel_path}"
+      if [[ ! -e "$live_file" ]]; then
+        _sync_add_drift "changed_repo_file" "$item_id" "${repo_path}/${rel_path}" "${target_path}/${rel_path}" "Repo file has no live counterpart."
+        _sync_item_changed "$item_id" "repo_only" "${repo_path}/${rel_path}" "${target_path}/${rel_path}" "changed_repo_file"
+      fi
+    done < <(find "$repo_source" -type f -print0 2>/dev/null || true)
+  fi
+}
+
+_sync_manifest_untracked_discovered_configs() {
+  local manifest_file="$1"
+  local discovery_file="${DOTFRIEND_CACHE_DIR}/discovery.json"
+  [[ -f "$discovery_file" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  local discovered selected config_name
+  discovered="$(jq -r '
+    if (.schema_version // 1) == 2 then
+      .config_dirs[]? | if type == "object" then (.name // empty) else . end
+    else
+      (.config_dirs // "" | split("\n")[]?)
+    end
+  ' "$discovery_file" 2>/dev/null || true)"
+  selected="$(jq -r '.items[]? | select(.selected != false and .type == "config_dir") | .target_path | sub("^~/.config/"; "")' "$manifest_file" 2>/dev/null || true)"
+
+  while IFS= read -r config_name; do
+    [[ -n "$config_name" ]] || continue
+    if ! printf '%s\n' "$selected" | grep -qxF "$config_name"; then
+      _sync_add_drift "untracked_discovered_config" "config_dir:${config_name}" "config/${config_name}" "~/.config/${config_name}" "Discovered config is not selected in the restore manifest."
+      _sync_item_changed "config_dir:${config_name}" "untracked" "config/${config_name}" "~/.config/${config_name}" "untracked_discovered_config"
+    fi
+  done <<< "$discovered"
+}
+
+sync_manifest_owned_paths() {
+  local manifest_file="$1"
+  local item_json item_id repo_path target_path restore_mode
+
+  _sync_emit_event "step_started" '{"step":"manifest_sync","label":"Syncing manifest-owned paths"}'
+
+  while IFS= read -r item_json; do
+    [[ -n "$item_json" ]] || continue
+    item_id="$(jq -r '.id' <<< "$item_json")"
+    repo_path="$(jq -r '.repo_path // empty' <<< "$item_json")"
+    target_path="$(jq -r '.target_path // empty' <<< "$item_json")"
+    restore_mode="$(jq -r '.restore_mode // empty' <<< "$item_json")"
+
+    [[ -n "$repo_path" && -n "$target_path" ]] || continue
+    case "$restore_mode" in
+      copy|rsync)
+        _sync_manifest_dir_item "$item_id" "$repo_path" "$target_path"
+        ;;
+      symlink|managed_json_merge|managed_markdown_block|defaults_import)
+        _sync_manifest_file_item "$item_id" "$repo_path" "$target_path"
+        ;;
+      *)
+        ;;
+    esac
+  done < <(jq -c '.items[]? | select(.selected != false)' "$manifest_file")
+
+  _sync_manifest_untracked_discovered_configs "$manifest_file"
+
+  _sync_emit_event "step_finished" "$(jq -cn --arg step "manifest_sync" --arg status "ok" --argjson counts "$(jq -cn --argjson drift "$SYNC_DRIFT_JSON" --argjson changes "$SYNC_CHANGE_COUNT" '{drift:($drift|length),changes:$changes}')" '{step:$step,status:$status,counts:$counts}')"
+
+  if [[ "$SYNC_EVENTS" != "true" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      gum_style --foreground "#8BE9FD" "  Manifest sync: ${SYNC_CHANGE_COUNT} changes, $(jq -r 'length' <<< "$SYNC_DRIFT_JSON") drift items (dry-run)"
+    else
+      gum_style --foreground "#8BE9FD" "  Manifest sync: ${SYNC_CHANGE_COUNT} changes"
+    fi
   fi
 }
 
@@ -753,53 +990,136 @@ cmd_sync() {
   done
 
   if [[ "$DRY_RUN" == true ]]; then
-    gum_style --foreground "#F1FA8C" "🛡  Dry-run mode: no files will be modified."
+    if [[ "$SYNC_EVENTS" == "true" ]]; then
+      _sync_log "Dry-run mode: no files will be modified."
+    else
+      gum_style --foreground "#F1FA8C" "🛡  Dry-run mode: no files will be modified."
+    fi
   fi
+
+  _sync_emit_event "job_started" '{"job":"sync"}'
 
   # Resolve repo directory
   REPO_DIR="$(_find_repo)" || true
   if [[ -z "$REPO_DIR" ]]; then
+    _sync_emit_event "error" '{"code":"managed_repo_missing","message":"Could not find dotfiles repo."}'
+    _sync_emit_event "job_finished" '{"job":"sync","status":"failed"}'
     log_error "Could not find dotfiles repo. Are you inside it?"
     return 1
   fi
   _save_repo_cache
 
-  log_info "Syncing repo: ${REPO_DIR}"
+  if [[ "$SYNC_EVENTS" == "true" ]]; then
+    _sync_log "Syncing repo: ${REPO_DIR}"
+  else
+    log_info "Syncing repo: ${REPO_DIR}"
+  fi
+
+  local manifest_file manifest_status
+  manifest_file="$(_load_restore_manifest)" || manifest_status=$?
+  manifest_status="${manifest_status:-0}"
+
+  if [[ "$manifest_status" == "0" && -n "$manifest_file" ]]; then
+    if [[ "$QUICK" == true ]]; then
+      if [[ "$SYNC_EVENTS" == "true" ]]; then
+        _sync_log "Quick mode: skipping full discovery drill-down."
+      else
+        log_info "Quick mode: skipping full discovery drill-down."
+      fi
+    else
+      _sync_emit_event "step_started" '{"step":"discovery","label":"Scanning system"}'
+      if type run_discovery >/dev/null 2>&1; then
+        if run_discovery >&2; then
+          _sync_emit_event "step_finished" '{"step":"discovery","status":"ok"}'
+        else
+          _sync_warning "discovery_failed" "Discovery returned errors; continuing." "{}"
+          _sync_emit_event "step_finished" '{"step":"discovery","status":"warning"}'
+        fi
+      else
+        _sync_warning "discovery_unavailable" "Discovery module not available. Using cached state." "{}"
+        _sync_emit_event "step_finished" '{"step":"discovery","status":"warning"}'
+      fi
+    fi
+
+    sync_manifest_owned_paths "$manifest_file"
+    if [[ "$DRY_RUN" != true ]]; then
+      show_diff_summary
+      prompt_commit
+    elif [[ "$SYNC_EVENTS" != "true" ]]; then
+      show_diff_summary
+    fi
+
+    local final_status="ok"
+    if [[ "$SYNC_WARNING_COUNT" -gt 0 ]]; then
+      final_status="warning"
+    fi
+    _sync_emit_event "job_finished" "$(jq -cn --arg job "sync" --arg status "$final_status" --argjson counts "$(jq -cn --argjson drift "$SYNC_DRIFT_JSON" --argjson changes "$SYNC_CHANGE_COUNT" --argjson warnings "$SYNC_WARNING_COUNT" '{drift:($drift|length),changes:$changes,warnings:$warnings}')" '{job:$job,status:$status,counts:$counts}')"
+    if [[ "$SYNC_EVENTS" != "true" ]]; then
+      log_ok "Sync complete."
+    fi
+    return 0
+  fi
+
+  if [[ "$manifest_status" == "2" ]]; then
+    _sync_emit_event "job_finished" '{"job":"sync","status":"failed"}'
+    return 1
+  fi
+
+  _sync_warning "manifest_missing" "Generated repo has no restore manifest; legacy sync behavior applies." "{}"
 
   # 1. Re-run discovery (or use cached state with --quick)
   if [[ "$QUICK" == true ]]; then
-    log_info "Quick mode: skipping full discovery drill-down."
-  else
-    log_step "Discovery"
-    if type run_discovery >/dev/null 2>&1; then
-      run_discovery || log_warn "Discovery returned errors, continuing..."
+    if [[ "$SYNC_EVENTS" == "true" ]]; then
+      _sync_log "Quick mode: skipping full discovery drill-down."
     else
-      log_info "Discovery module not available. Using cached state."
+      log_info "Quick mode: skipping full discovery drill-down."
+    fi
+  else
+    if [[ "$SYNC_EVENTS" == "true" ]]; then
+      _sync_emit_event "step_started" '{"step":"discovery","label":"Scanning system"}'
+    else
+      log_step "Discovery"
+    fi
+    if type run_discovery >/dev/null 2>&1; then
+      if run_discovery >&2; then
+        _sync_emit_event "step_finished" '{"step":"discovery","status":"ok"}'
+      else
+        _sync_warning "discovery_failed" "Discovery returned errors; continuing." "{}"
+        _sync_emit_event "step_finished" '{"step":"discovery","status":"warning"}'
+      fi
+    else
+      _sync_warning "discovery_unavailable" "Discovery module not available. Using cached state." "{}"
+      _sync_emit_event "step_finished" '{"step":"discovery","status":"warning"}'
     fi
   fi
 
   # 2. Config sync
-  sync_configs
+  if [[ "$SYNC_EVENTS" == "true" ]]; then sync_configs >&2; else sync_configs; fi
 
   # 3. Brew sync
-  sync_brewfile
+  if [[ "$SYNC_EVENTS" == "true" ]]; then sync_brewfile >&2; else sync_brewfile; fi
 
   # 4. npm sync
-  sync_npm
+  if [[ "$SYNC_EVENTS" == "true" ]]; then sync_npm >&2; else sync_npm; fi
 
   # 5. Editor extension sync
-  sync_editor_extensions
+  if [[ "$SYNC_EVENTS" == "true" ]]; then sync_editor_extensions >&2; else sync_editor_extensions; fi
 
   # 6. Agent sync
-  sync_agents
+  if [[ "$SYNC_EVENTS" == "true" ]]; then sync_agents >&2; else sync_agents; fi
 
   # 7. Show diff summary
-  show_diff_summary
+  if [[ "$SYNC_EVENTS" == "true" ]]; then show_diff_summary >&2; else show_diff_summary; fi
 
   # 8. Optional commit
-  prompt_commit
+  if [[ "$SYNC_EVENTS" == "true" ]]; then prompt_commit >&2; else prompt_commit; fi
 
-  log_ok "Sync complete."
+  _sync_emit_event "job_finished" "$(jq -cn --arg job "sync" --arg status "warning" --argjson counts "$(jq -cn --argjson warnings "$SYNC_WARNING_COUNT" '{warnings:$warnings}')" '{job:$job,status:$status,counts:$counts}')"
+  if [[ "$SYNC_EVENTS" == "true" ]]; then
+    _sync_log "Sync complete."
+  else
+    log_ok "Sync complete."
+  fi
 }
 
 # If sourced, do nothing. If executed directly, run cmd_sync.

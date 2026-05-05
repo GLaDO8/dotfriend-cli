@@ -125,7 +125,11 @@ fi
 
 if [[ "${cmd}" == "start" || "${cmd}" == "sync" ]]; then
   if [[ "${DOTFRIEND_NO_BOOTSTRAP}" != "true" && "${DOTFRIEND_RUNTIME_BOOTSTRAPPED:-false}" != "true" ]]; then
-    bootstrap_runtime
+    if [[ "${DOTFRIEND_API_JSON}" == "true" || "${DOTFRIEND_API_EVENTS}" == "true" ]]; then
+      bootstrap_runtime >&2
+    else
+      bootstrap_runtime
+    fi
     exec env DOTFRIEND_RUNTIME_BOOTSTRAPPED=true "$0" "${ORIGINAL_ARGS[@]}"
   fi
 fi
