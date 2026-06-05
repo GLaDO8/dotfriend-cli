@@ -305,10 +305,24 @@ test_filtered_recursive_copy_and_layout() {
   printf '[user]\nname = Test\n' > "${HOME}/.gitconfig"
   printf 'prefix=/tmp/test\n' > "${HOME}/.npmrc"
 
-  mkdir -p "${HOME}/.config/opencode/node_modules/pkg" "${HOME}/.config/opencode/cache"
+  mkdir -p \
+    "${HOME}/.config/opencode/node_modules/pkg" \
+    "${HOME}/.config/opencode/cache" \
+    "${HOME}/.config/opencode/gcloud" \
+    "${HOME}/.config/opencode/virtenv" \
+    "${HOME}/.config/opencode/marketplace" \
+    "${HOME}/.config/opencode/.turbo" \
+    "${HOME}/.config/opencode/vendor" \
+    "${HOME}/.config/opencode/logs"
   printf '{"model":"gpt"}\n' > "${HOME}/.config/opencode/settings.json"
   printf 'node_modules/\n' > "${HOME}/.config/opencode/.gitignore"
   printf 'junk\n' > "${HOME}/.config/opencode/node_modules/pkg/index.js"
+  printf 'gcloud cache\n' > "${HOME}/.config/opencode/gcloud/cache.db"
+  printf 'python runtime\n' > "${HOME}/.config/opencode/virtenv/runtime.py"
+  printf 'market cache\n' > "${HOME}/.config/opencode/marketplace/list.json"
+  printf 'generated cache\n' > "${HOME}/.config/opencode/.turbo/cache.bin"
+  printf 'dependency tree\n' > "${HOME}/.config/opencode/vendor/lib.js"
+  printf 'log line\n' > "${HOME}/.config/opencode/logs/run.log"
 
   source_generator
 
@@ -344,16 +358,29 @@ test_filtered_recursive_copy_and_layout() {
     ok "node_modules is excluded from copied configs"
   fi
 
+  local filtered_path
+  for filtered_path in gcloud/cache.db virtenv/runtime.py marketplace/list.json .turbo/cache.bin vendor/lib.js logs/run.log; do
+    if [[ -e "${repo_dir}/config/opencode/${filtered_path}" ]]; then
+      ko "runtime-heavy config paths are excluded" "${filtered_path} was copied"
+      return
+    fi
+  done
+  ok "runtime-heavy config paths are excluded"
+
   if [[ -e "${repo_dir}/config/opencode/.gitignore" ]]; then
     ko ".gitignore files are excluded from copied configs" ".gitignore was copied"
   else
     ok ".gitignore files are excluded from copied configs"
   fi
 
-  if grep -q 'node_modules/' "${repo_dir}/.gitignore"; then
-    ok "generated .gitignore still ignores node_modules"
+  if grep -q 'node_modules/' "${repo_dir}/.gitignore" && \
+     grep -q 'virtenv/' "${repo_dir}/.gitignore" && \
+     grep -q 'marketplace/' "${repo_dir}/.gitignore" && \
+     grep -q '.turbo/' "${repo_dir}/.gitignore" && \
+     grep -q 'vendor/' "${repo_dir}/.gitignore"; then
+    ok "generated .gitignore still ignores dependency and runtime paths"
   else
-    ko "generated .gitignore still ignores node_modules" "missing node_modules rule"
+    ko "generated .gitignore still ignores dependency and runtime paths" "missing expected ignore rule"
   fi
 
   if grep -q '_symlink "\$DOTFILES_DIR/zsh/.zshrc" "\$HOME/.zshrc"' "${repo_dir}/install.sh" && \

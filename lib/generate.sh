@@ -87,30 +87,81 @@ _repo_path_for_dotfile() {
 
 _copy_tree_filtered() {
   local src="$1" dest="$2"
+  local filter_profile="${3:-config}"
   ensure_dir "$dest"
 
   if command -v rsync >/dev/null 2>&1; then
+    local config_excludes=()
+    if [[ "$filter_profile" == "config" ]]; then
+      config_excludes+=(--exclude 'extensions/')
+    fi
     rsync -a \
       --exclude '.git/' \
       --exclude '.gitignore' \
       --exclude 'node_modules/' \
+      --exclude 'bower_components/' \
+      --exclude 'jspm_packages/' \
       --exclude '.next/' \
       --exclude 'dist/' \
       --exclude 'build/' \
+      --exclude '.build/' \
       --exclude 'coverage/' \
+      --exclude 'vendor/' \
+      --exclude 'Pods/' \
+      --exclude '.gradle/' \
       --exclude '__pycache__/' \
       --exclude '.pytest_cache/' \
+      --exclude '.mypy_cache/' \
+      --exclude '.ruff_cache/' \
+      --exclude '.tox/' \
+      --exclude 'virtenv/' \
+      --exclude 'venv/' \
+      --exclude '.venv/' \
+      --exclude 'virtualenv/' \
+      --exclude 'gcloud/' \
+      --exclude '.gcloud/' \
       --exclude '.cache/' \
+      --exclude 'cache/' \
+      --exclude 'Cache/' \
+      --exclude 'Caches/' \
+      --exclude '.npm/' \
+      --exclude '.pnpm-store/' \
+      --exclude '.yarn/' \
       --exclude 'tmp/' \
       --exclude 'temp/' \
+      --exclude 'logs/' \
+      --exclude 'log/' \
+      --exclude 'marketplace/' \
+      --exclude 'marketplaces/' \
+      --exclude 'plugin-marketplace/' \
+      --exclude 'plugin-marketplaces/' \
+      --exclude 'sessions/' \
+      --exclude 'archived_sessions/' \
+      --exclude 'generated/' \
+      --exclude '.generated/' \
+      --exclude 'generated_images/' \
+      --exclude 'sqlite/' \
+      --exclude '.turbo/' \
+      --exclude '.parcel-cache/' \
+      --exclude '.vite/' \
+      --exclude '.nuxt/' \
+      --exclude '.svelte-kit/' \
+      --exclude '.astro/' \
+      "${config_excludes[@]}" \
       "$src/" "$dest/"
     return 0
   fi
 
   cp -a "$src/." "$dest/"
-  find "$dest" \
-    \( -name '.git' -o -name 'node_modules' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name 'coverage' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.cache' -o -name 'tmp' -o -name 'temp' \) \
-    -prune -exec rm -rf {} + 2>/dev/null || true
+  if [[ "$filter_profile" == "config" ]]; then
+    find "$dest" \
+      \( -name '.git' -o -name 'node_modules' -o -name 'bower_components' -o -name 'jspm_packages' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name '.build' -o -name 'coverage' -o -name 'vendor' -o -name 'Pods' -o -name '.gradle' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name '.tox' -o -name 'virtenv' -o -name 'venv' -o -name '.venv' -o -name 'virtualenv' -o -name 'gcloud' -o -name '.gcloud' -o -name '.cache' -o -name 'cache' -o -name 'Cache' -o -name 'Caches' -o -name '.npm' -o -name '.pnpm-store' -o -name '.yarn' -o -name 'tmp' -o -name 'temp' -o -name 'logs' -o -name 'log' -o -name 'marketplace' -o -name 'marketplaces' -o -name 'plugin-marketplace' -o -name 'plugin-marketplaces' -o -name 'sessions' -o -name 'archived_sessions' -o -name 'generated' -o -name '.generated' -o -name 'generated_images' -o -name 'sqlite' -o -name '.turbo' -o -name '.parcel-cache' -o -name '.vite' -o -name '.nuxt' -o -name '.svelte-kit' -o -name '.astro' -o -name 'extensions' \) \
+      -prune -exec rm -rf {} + 2>/dev/null || true
+  else
+    find "$dest" \
+      \( -name '.git' -o -name 'node_modules' -o -name 'bower_components' -o -name 'jspm_packages' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name '.build' -o -name 'coverage' -o -name 'vendor' -o -name 'Pods' -o -name '.gradle' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name '.tox' -o -name 'virtenv' -o -name 'venv' -o -name '.venv' -o -name 'virtualenv' -o -name 'gcloud' -o -name '.gcloud' -o -name '.cache' -o -name 'cache' -o -name 'Cache' -o -name 'Caches' -o -name '.npm' -o -name '.pnpm-store' -o -name '.yarn' -o -name 'tmp' -o -name 'temp' -o -name 'logs' -o -name 'log' -o -name 'marketplace' -o -name 'marketplaces' -o -name 'plugin-marketplace' -o -name 'plugin-marketplaces' -o -name 'sessions' -o -name 'archived_sessions' -o -name 'generated' -o -name '.generated' -o -name 'generated_images' -o -name 'sqlite' -o -name '.turbo' -o -name '.parcel-cache' -o -name '.vite' -o -name '.nuxt' -o -name '.svelte-kit' -o -name '.astro' \) \
+      -prune -exec rm -rf {} + 2>/dev/null || true
+  fi
   find "$dest" -name '.gitignore' -type f -delete 2>/dev/null || true
 }
 
@@ -353,10 +404,43 @@ __pycache__/
 *.pyo
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
 *.cache
 .cache/
+cache/
+Caches/
 node_modules/
+bower_components/
+jspm_packages/
+vendor/
+Pods/
+.gradle/
+.npm/
+.pnpm-store/
+.yarn/
+.venv/
+venv/
+virtenv/
+virtualenv/
+gcloud/
+.gcloud/
 .next/cache/
+.turbo/
+.parcel-cache/
+.vite/
+.nuxt/
+.svelte-kit/
+.astro/
+marketplace/
+marketplaces/
+plugin-marketplace/
+plugin-marketplaces/
+generated/
+.generated/
+generated_images/
+sqlite/
 
 ### OS files ###
 .DS_Store
@@ -374,6 +458,7 @@ Thumbs.db
 ### Logs ###
 *.log
 logs/
+log/
 
 ### Temporary files ###
 tmp/
@@ -870,7 +955,7 @@ _copy_agent_configs() {
       [[ -z "$d" ]] && continue
       local src="${canonical_dir}/${d}"
       if [[ -d "$src" && ! -L "$src" ]]; then
-        _copy_tree_filtered "$src" "${dest}/${d}"
+        _copy_tree_filtered "$src" "${dest}/${d}" "agent"
         log_ok "Copied ${d}/ for ${agent_id}"
       elif [[ -L "$src" ]]; then
         log_info "Skipping symlinked dir: ${src}"
@@ -879,11 +964,11 @@ _copy_agent_configs() {
   done < <(_selected_agent_ids)
 
   if [[ -d "${HOME}/.agents/skills" ]]; then
-    _copy_tree_filtered "${HOME}/.agents/skills" "${GEN_DIR}/agents/skills"
+    _copy_tree_filtered "${HOME}/.agents/skills" "${GEN_DIR}/agents/skills" "agent"
     log_ok "Copied ~/.agents/skills"
   fi
   if [[ -d "${HOME}/.agents/agent-docs" ]]; then
-    _copy_tree_filtered "${HOME}/.agents/agent-docs" "${GEN_DIR}/agents/agent-docs"
+    _copy_tree_filtered "${HOME}/.agents/agent-docs" "${GEN_DIR}/agents/agent-docs" "agent"
     log_ok "Copied ~/.agents/agent-docs"
   fi
 }

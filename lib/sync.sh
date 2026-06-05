@@ -127,6 +127,53 @@ _expand_home_path() {
   printf '%s' "$path"
 }
 
+_sync_now_seconds() {
+  date +%s
+}
+
+_sync_file_size() {
+  local path="$1"
+  stat -f '%z' "$path" 2>/dev/null || stat -c '%s' "$path" 2>/dev/null || wc -c < "$path" | tr -d ' '
+}
+
+_sync_files_differ() {
+  local repo_file="$1" live_file="$2"
+
+  if [[ ! "$repo_file" -nt "$live_file" && ! "$live_file" -nt "$repo_file" ]]; then
+    if [[ "$(_sync_file_size "$repo_file")" == "$(_sync_file_size "$live_file")" ]]; then
+      return 1
+    fi
+  fi
+
+  ! cmp -s "$repo_file" "$live_file" >/dev/null 2>&1
+}
+
+_sync_manifest_item_finished() {
+  local item_id="$1" item_type="$2" repo_path="$3" target_path="$4" started_at="$5" changes_before="$6" drift_before="$7"
+  local finished_at elapsed_seconds drift_count drift_delta change_delta
+  finished_at="$(_sync_now_seconds)"
+  elapsed_seconds=$((finished_at - started_at))
+  drift_count="$(jq -r 'length' <<< "$SYNC_DRIFT_JSON")"
+  drift_delta=$((drift_count - drift_before))
+  change_delta=$((SYNC_CHANGE_COUNT - changes_before))
+
+  if [[ "$SYNC_EVENTS" == "true" ]]; then
+    _sync_log "manifest item ${item_id} finished in ${elapsed_seconds}s (${change_delta} changes, ${drift_delta} drift)"
+  else
+    log_info "Manifest item ${item_id} finished in ${elapsed_seconds}s (${change_delta} changes, ${drift_delta} drift)"
+  fi
+
+  _sync_emit_event "item_finished" "$(jq -cn \
+    --arg item_id "$item_id" \
+    --arg item_type "$item_type" \
+    --arg repo_path "$repo_path" \
+    --arg target_path "$target_path" \
+    --argjson elapsed_seconds "$elapsed_seconds" \
+    --argjson changes "$change_delta" \
+    --argjson drift "$drift_delta" \
+    '{item_id:$item_id,item_type:$item_type,repo_path:$repo_path,target_path:$target_path,elapsed_seconds:$elapsed_seconds,counts:{changes:$changes,drift:$drift}}')"
+}
+
 _load_restore_manifest() {
   local manifest_file="${REPO_DIR}/.dotfriend/restore-manifest.json"
   if [[ ! -f "$manifest_file" ]]; then
@@ -168,7 +215,7 @@ _sync_manifest_file_item() {
     return 0
   fi
 
-  if ! diff -q "$repo_source" "$live_target" >/dev/null 2>&1; then
+  if _sync_files_differ "$repo_source" "$live_target"; then
     _sync_add_drift "changed_live_file" "$item_id" "$repo_path" "$target_path" "Live file differs from repo source."
     _sync_item_changed "$item_id" "update" "$repo_path" "$target_path" "changed_live_file"
     if [[ "$DRY_RUN" != true ]]; then
@@ -180,6 +227,7 @@ _sync_manifest_file_item() {
 
 _sync_manifest_dir_item() {
   local item_id="$1" repo_path="$2" target_path="$3"
+  local filter_profile="${4:-config}"
   local repo_source="${REPO_DIR}/${repo_path}"
   local live_target
   live_target="$(_expand_home_path "$target_path")"
@@ -214,14 +262,14 @@ _sync_manifest_dir_item() {
       continue
     fi
 
-    if ! diff -q "$repo_file" "$live_file" >/dev/null 2>&1; then
+    if _sync_files_differ "$repo_file" "$live_file"; then
       _sync_add_drift "changed_live_file" "$item_id" "$event_repo_path" "$event_target_path" "Live file differs from repo source."
       _sync_item_changed "$item_id" "update" "$event_repo_path" "$event_target_path" "changed_live_file"
       if [[ "$DRY_RUN" != true ]]; then
         cp -a "$live_file" "$repo_file"
       fi
     fi
-  done < <(find "$live_target" -type f -print0 2>/dev/null || true)
+  done < <(_sync_find_files_filtered "$live_target" "$filter_profile")
 
   if [[ -d "$repo_source" ]]; then
     while IFS= read -r -d '' repo_file; do
@@ -231,8 +279,67 @@ _sync_manifest_dir_item() {
         _sync_add_drift "changed_repo_file" "$item_id" "${repo_path}/${rel_path}" "${target_path}/${rel_path}" "Repo file has no live counterpart."
         _sync_item_changed "$item_id" "repo_only" "${repo_path}/${rel_path}" "${target_path}/${rel_path}" "changed_repo_file"
       fi
-    done < <(find "$repo_source" -type f -print0 2>/dev/null || true)
+    done < <(_sync_find_files_filtered "$repo_source" "$filter_profile")
   fi
+}
+
+_sync_find_files_filtered() {
+  local root="$1" filter_profile="${2:-config}"
+  if [[ "$filter_profile" == "config" ]]; then
+    find "$root" \
+      \( -name '.git' -o -name 'node_modules' -o -name 'bower_components' -o -name 'jspm_packages' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name '.build' -o -name 'coverage' -o -name 'vendor' -o -name 'Pods' -o -name '.gradle' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name '.tox' -o -name 'virtenv' -o -name 'venv' -o -name '.venv' -o -name 'virtualenv' -o -name 'gcloud' -o -name '.gcloud' -o -name '.cache' -o -name 'cache' -o -name 'Cache' -o -name 'Caches' -o -name '.npm' -o -name '.pnpm-store' -o -name '.yarn' -o -name 'tmp' -o -name 'temp' -o -name 'logs' -o -name 'log' -o -name 'marketplace' -o -name 'marketplaces' -o -name 'plugin-marketplace' -o -name 'plugin-marketplaces' -o -name 'sessions' -o -name 'archived_sessions' -o -name 'generated' -o -name '.generated' -o -name 'generated_images' -o -name 'sqlite' -o -name '.turbo' -o -name '.parcel-cache' -o -name '.vite' -o -name '.nuxt' -o -name '.svelte-kit' -o -name '.astro' -o -name 'extensions' \) \
+      -prune -o -type f -print0 2>/dev/null || true
+  else
+    find "$root" \
+      \( -name '.git' -o -name 'node_modules' -o -name 'bower_components' -o -name 'jspm_packages' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name '.build' -o -name 'coverage' -o -name 'vendor' -o -name 'Pods' -o -name '.gradle' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name '.tox' -o -name 'virtenv' -o -name 'venv' -o -name '.venv' -o -name 'virtualenv' -o -name 'gcloud' -o -name '.gcloud' -o -name '.cache' -o -name 'cache' -o -name 'Cache' -o -name 'Caches' -o -name '.npm' -o -name '.pnpm-store' -o -name '.yarn' -o -name 'tmp' -o -name 'temp' -o -name 'logs' -o -name 'log' -o -name 'marketplace' -o -name 'marketplaces' -o -name 'plugin-marketplace' -o -name 'plugin-marketplaces' -o -name 'sessions' -o -name 'archived_sessions' -o -name 'generated' -o -name '.generated' -o -name 'generated_images' -o -name 'sqlite' -o -name '.turbo' -o -name '.parcel-cache' -o -name '.vite' -o -name '.nuxt' -o -name '.svelte-kit' -o -name '.astro' \) \
+      -prune -o -type f -print0 2>/dev/null || true
+  fi
+}
+
+_sync_manifest_path_is_skipped() {
+  local path="$1" skips="$2" skip expanded_skip
+  while IFS= read -r skip; do
+    [[ -n "$skip" ]] || continue
+    expanded_skip="$(_expand_home_path "$skip")"
+    if [[ "$path" == "$expanded_skip" || "$path" == "${expanded_skip}/"* ]]; then
+      return 0
+    fi
+  done <<< "$skips"
+  return 1
+}
+
+_sync_manifest_agent_config_item() {
+  local item_id="$1" repo_path="$2" target_path="$3" item_json="$4"
+  local live_root
+  live_root="$(_expand_home_path "$target_path")"
+
+  if [[ ! -d "$live_root" ]]; then
+    _sync_add_drift "missing_live_target" "$item_id" "$repo_path" "$target_path" "Live target is missing."
+    _sync_item_changed "$item_id" "missing_live_target" "$repo_path" "$target_path" "missing_live_target"
+    return 0
+  fi
+
+  local symlinks_to_skip
+  symlinks_to_skip="$(jq -r '.metadata.symlinks_to_skip // [] | .[]' <<< "$item_json" 2>/dev/null || true)"
+
+  local rel_path live_path
+  while IFS= read -r rel_path; do
+    [[ -n "$rel_path" ]] || continue
+    live_path="${live_root}/${rel_path}"
+    if [[ -L "$live_path" ]] || _sync_manifest_path_is_skipped "$live_path" "$symlinks_to_skip"; then
+      continue
+    fi
+    _sync_manifest_file_item "${item_id}:${rel_path}" "${repo_path}/${rel_path}" "${target_path}/${rel_path}"
+  done < <(jq -r '.metadata.important_files // [] | .[]' <<< "$item_json" 2>/dev/null || true)
+
+  while IFS= read -r rel_path; do
+    [[ -n "$rel_path" ]] || continue
+    live_path="${live_root}/${rel_path}"
+    if [[ -L "$live_path" ]] || _sync_manifest_path_is_skipped "$live_path" "$symlinks_to_skip"; then
+      continue
+    fi
+    _sync_manifest_dir_item "${item_id}:${rel_path}" "${repo_path}/${rel_path}" "${target_path}/${rel_path}" "agent"
+  done < <(jq -r '.metadata.important_dirs // [] | .[]' <<< "$item_json" 2>/dev/null || true)
 }
 
 _sync_manifest_untracked_discovered_configs() {
@@ -262,18 +369,36 @@ _sync_manifest_untracked_discovered_configs() {
 
 sync_manifest_owned_paths() {
   local manifest_file="$1"
-  local item_json item_id repo_path target_path restore_mode
+  local item_json item_id item_type repo_path target_path restore_mode
 
   _sync_emit_event "step_started" '{"step":"manifest_sync","label":"Syncing manifest-owned paths"}'
 
   while IFS= read -r item_json; do
     [[ -n "$item_json" ]] || continue
     item_id="$(jq -r '.id' <<< "$item_json")"
+    item_type="$(jq -r '.type // empty' <<< "$item_json")"
     repo_path="$(jq -r '.repo_path // empty' <<< "$item_json")"
     target_path="$(jq -r '.target_path // empty' <<< "$item_json")"
     restore_mode="$(jq -r '.restore_mode // empty' <<< "$item_json")"
 
     [[ -n "$repo_path" && -n "$target_path" ]] || continue
+    local item_started_at item_changes_before item_drift_before
+    item_started_at="$(_sync_now_seconds)"
+    item_changes_before="$SYNC_CHANGE_COUNT"
+    item_drift_before="$(jq -r 'length' <<< "$SYNC_DRIFT_JSON")"
+    _sync_emit_event "item_started" "$(jq -cn \
+      --arg item_id "$item_id" \
+      --arg item_type "$item_type" \
+      --arg repo_path "$repo_path" \
+      --arg target_path "$target_path" \
+      '{item_id:$item_id,item_type:$item_type,repo_path:$repo_path,target_path:$target_path}')"
+
+    if [[ "$item_type" == "agent_config" ]]; then
+      _sync_manifest_agent_config_item "$item_id" "$repo_path" "$target_path" "$item_json"
+      _sync_manifest_item_finished "$item_id" "$item_type" "$repo_path" "$target_path" "$item_started_at" "$item_changes_before" "$item_drift_before"
+      continue
+    fi
+
     case "$restore_mode" in
       copy|rsync)
         _sync_manifest_dir_item "$item_id" "$repo_path" "$target_path"
@@ -284,6 +409,7 @@ sync_manifest_owned_paths() {
       *)
         ;;
     esac
+    _sync_manifest_item_finished "$item_id" "$item_type" "$repo_path" "$target_path" "$item_started_at" "$item_changes_before" "$item_drift_before"
   done < <(jq -c '.items[]? | select(.selected != false)' "$manifest_file")
 
   _sync_manifest_untracked_discovered_configs "$manifest_file"
@@ -339,7 +465,7 @@ sync_configs() {
         continue
       fi
 
-      if ! diff -q "$repo_file" "$live_file" >/dev/null 2>&1; then
+      if _sync_files_differ "$repo_file" "$live_file"; then
         if [[ "$DRY_RUN" == true ]]; then
           gum_style --foreground "#F1FA8C" "  [dry-run] Would update ${app_name}/${rel_path}"
         else
@@ -711,14 +837,14 @@ sync_editor_extensions() {
       code --list-extensions 2>/dev/null | sort > "$tmpfile"
 
       if [[ "$DRY_RUN" == true ]]; then
-        if [[ ! -f "$target_file" ]] || ! diff -q "$target_file" "$tmpfile" >/dev/null 2>&1; then
+        if [[ ! -f "$target_file" ]] || _sync_files_differ "$target_file" "$tmpfile"; then
           gum_style --foreground "#F1FA8C" "  [dry-run] Would update vscode/extensions.txt"
         else
           log_ok "VS Code extensions are up to date."
         fi
       else
         ensure_dir "$(dirname "$target_file")"
-        if [[ ! -f "$target_file" ]] || ! diff -q "$target_file" "$tmpfile" >/dev/null 2>&1; then
+        if [[ ! -f "$target_file" ]] || _sync_files_differ "$target_file" "$tmpfile"; then
           mv "$tmpfile" "$target_file"
           tmpfile=""
           log_ok "Updated vscode/extensions.txt"
@@ -741,14 +867,14 @@ sync_editor_extensions() {
       cursor --list-extensions 2>/dev/null | sort > "$tmpfile"
 
       if [[ "$DRY_RUN" == true ]]; then
-        if [[ ! -f "$target_file" ]] || ! diff -q "$target_file" "$tmpfile" >/dev/null 2>&1; then
+        if [[ ! -f "$target_file" ]] || _sync_files_differ "$target_file" "$tmpfile"; then
           gum_style --foreground "#F1FA8C" "  [dry-run] Would update cursor/extensions.txt"
         else
           log_ok "Cursor extensions are up to date."
         fi
       else
         ensure_dir "$(dirname "$target_file")"
-        if [[ ! -f "$target_file" ]] || ! diff -q "$target_file" "$tmpfile" >/dev/null 2>&1; then
+        if [[ ! -f "$target_file" ]] || _sync_files_differ "$target_file" "$tmpfile"; then
           mv "$tmpfile" "$target_file"
           tmpfile=""
           log_ok "Updated cursor/extensions.txt"
@@ -871,7 +997,7 @@ sync_agents() {
         continue
       fi
 
-      if [[ ! -e "$repo_file" ]] || ! diff -q "$repo_file" "$live_file" >/dev/null 2>&1; then
+      if [[ ! -e "$repo_file" ]] || _sync_files_differ "$repo_file" "$live_file"; then
         if [[ "$DRY_RUN" == true ]]; then
           if [[ ! -e "$repo_file" ]]; then
             gum_style --foreground "#50FA7B" "  [dry-run] Would add ${agent_id}/${rel_path}"
@@ -1043,8 +1169,14 @@ cmd_sync() {
 
     sync_manifest_owned_paths "$manifest_file"
     if [[ "$DRY_RUN" != true ]]; then
-      show_diff_summary
-      prompt_commit
+      if [[ "$SYNC_EVENTS" != "true" ]]; then
+        show_diff_summary
+      fi
+      if [[ "$SYNC_EVENTS" == "true" ]]; then
+        prompt_commit >&2
+      else
+        prompt_commit
+      fi
     elif [[ "$SYNC_EVENTS" != "true" ]]; then
       show_diff_summary
     fi
@@ -1109,7 +1241,7 @@ cmd_sync() {
   if [[ "$SYNC_EVENTS" == "true" ]]; then sync_agents >&2; else sync_agents; fi
 
   # 7. Show diff summary
-  if [[ "$SYNC_EVENTS" == "true" ]]; then show_diff_summary >&2; else show_diff_summary; fi
+  if [[ "$SYNC_EVENTS" != "true" ]]; then show_diff_summary; fi
 
   # 8. Optional commit
   if [[ "$SYNC_EVENTS" == "true" ]]; then prompt_commit >&2; else prompt_commit; fi
