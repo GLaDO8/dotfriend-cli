@@ -176,6 +176,20 @@ case "${cmd}" in
     fi
     # shellcheck source=lib/discovery.sh
     source "${LIB_DIR}/discovery.sh"
+    discover_cached=false
+    for arg in "${args[@]}"; do
+      case "$arg" in
+        --cached) discover_cached=true ;;
+      esac
+    done
+    if [[ "${discover_cached}" == "true" && "${DOTFRIEND_API_EVENTS}" == "true" ]]; then
+      api_fail "discover" "cached_events_unsupported" "Use dotfriend discover --json --cached."
+      exit 2
+    fi
+    if [[ "${discover_cached}" == "true" ]]; then
+      api_print_envelope "ok" "discover" "$(discovery_cache_data_json)"
+      exit 0
+    fi
     if [[ "${DOTFRIEND_API_EVENTS}" == "true" ]]; then
       api_event "job_started" '{"job":"discover"}'
       api_event "step_started" '{"step":"discovery","label":"Scanning system"}'

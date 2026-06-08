@@ -51,6 +51,7 @@ These commands are stable for app callers. `--json` prints one JSON object. `--e
 |---------|-------------|
 | `dotfriend preflight --json` | Report runtime readiness and planned bootstrap work without changing machine state. |
 | `dotfriend discover --json` | Run discovery and return the structured discovery cache. |
+| `dotfriend discover --json --cached` | Return the existing structured discovery cache without running discovery. |
 | `dotfriend discover --events` | Stream discovery progress as JSON events. |
 | `dotfriend plan --json` | Report planned sync actions from the manifest. |
 | `dotfriend status --json` | Report generated repo, manifest, and drift status. |

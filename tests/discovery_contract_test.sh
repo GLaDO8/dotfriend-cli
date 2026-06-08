@@ -85,6 +85,13 @@ done <<< "$event_output"
 printf '%s\n' "$event_output" | "$REAL_JQ" -e 'select(.event == "job_started" and .job == "discover")' >/dev/null
 printf '%s\n' "$event_output" | "$REAL_JQ" -e 'select(.event == "job_finished" and .status == "ok")' >/dev/null
 
+tmp_cache="${DOTFRIEND_CACHE_DIR}/discovery.cached.json"
+"$REAL_JQ" '.cached_only = true' "${DOTFRIEND_CACHE_DIR}/discovery.json" > "$tmp_cache"
+mv "$tmp_cache" "${DOTFRIEND_CACHE_DIR}/discovery.json"
+cached_output="$(./dotfriend discover --json --cached)"
+printf '%s\n' "$cached_output" | "$REAL_JQ" -e '.command == "discover" and .status == "ok"' >/dev/null
+printf '%s\n' "$cached_output" | "$REAL_JQ" -e '.data.discovery.cached_only == true' >/dev/null
+
 source "$PROJECT/lib/wizard.sh"
 v2_agents=()
 while IFS= read -r line; do
