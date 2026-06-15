@@ -6,13 +6,13 @@ Built with bash and [Gum](https://github.com/charmbracelet/gum) (by Charm). No c
 
 ## What it does
 
-**`dotfriend start`** — An interactive wizard that scans your Mac, lets you pick what to back up, and generates a complete `dotfiles` repository. It detects your apps, Homebrew packages, npm globals, shell configs, editor settings, agentic tool configs, and even your Dock layout.
+**`dotfriend start`** — An interactive wizard that scans your Mac, lets you pick what to back up, and generates a complete `dotfiles` repository. It detects your apps, Homebrew packages, npm globals, shell configs, editor settings, agentic tool configs, selected Mac settings, and even your Dock layout.
 
 **`dotfriend sync`** — Keeps your repo in sync with your machine. Detects new brew packages, changed config files, and updated agent settings. Optionally commits and pushes to GitHub.
 
 The generated repo includes a `bootstrap.sh` for brand-new Macs and an `install.sh` for full restoration - so you can go from a fresh macOS install to a fully configured machine in one command.
 
-Generated repos also include `.dotfriend/restore-manifest.json`, `.dotfriend/agent-artifacts.json`, `.dotfriend/selections.json`, and `.dotfriend/agent-tools.json`. The restore manifest is the file/path contract for install, status, plan, sync, and backup. The agent artifact manifest is the contract for managed MCPs, instructions, rules, skills, commands, and shared stores.
+Generated repos also include `.dotfriend/restore-manifest.json`, `.dotfriend/agent-artifacts.json`, `.dotfriend/selections.json`, and `.dotfriend/agent-tools.json`. The restore manifest is the file/path contract for install, status, plan, sync, and backup. The agent artifact manifest is the contract for managed MCPs, instructions, rules, skills, commands, and shared stores. When Mac settings are selected, generated repos also include `macos/defaults.json` and `scripts/apply-macos-defaults.sh`.
 
 ## Installation
 
@@ -53,6 +53,7 @@ These commands are stable for app callers. `--json` prints one JSON object. `--e
 | `dotfriend discover --json` | Run discovery and return the structured discovery cache. |
 | `dotfriend discover --json --cached` | Return the existing structured discovery cache without running discovery. |
 | `dotfriend discover --events` | Stream discovery progress as JSON events. |
+| `dotfriend generate --events --target <path> --no-push --force` | Generate selected repo contents for an app-managed first sync without prompting or pushing. |
 | `dotfriend plan --json` | Report planned sync actions from the manifest. |
 | `dotfriend status --json` | Report generated repo, manifest, and drift status. |
 | `dotfriend sync --events` | Stream sync progress as JSON events. |
@@ -63,7 +64,9 @@ These commands are stable for app callers. `--json` prints one JSON object. `--e
 
 ## Safety model
 
-dotfriend writes only generated repo content and selected restore targets. It does not intentionally back up secrets, chat history, caches, or logs.
+dotfriend writes only generated repo content and selected restore targets. It does not intentionally back up secrets, chat history, caches, logs, TCC/privacy grants, app logins, iCloud session state, Keychain items, or opaque app databases.
+
+Mac settings discovery is curated. dotfriend reads only the scalar settings listed in `lib/macos-defaults.json`; it does not export whole defaults domains or scrape settings at runtime. Safe and reversible settings can be selected by default. Settings marked `attention` or `risky` are shown for review but require explicit opt-in.
 
 Managed agent config is partial by default:
 
@@ -79,11 +82,24 @@ Managed agent config is partial by default:
 - **Homebrew** — taps, formulae, casks, Mac App Store apps (via `mas`)
 - **npm** — globally installed packages
 - **Dock layout** — app list (restorable via `dockutil`)
+- **Mac settings** — selected scalar settings from the curated catalog, currently covering Dock, Finder, Desktop, Screenshots, Menu Bar, Keyboard, Mouse, Trackpad, Mission Control, Safari, TextEdit, Xcode, Simulator, Activity Monitor, Messages, and Time Machine
 
 ### Config files
 - Shell configs (`.zshrc`, `.bashrc`, `.gitconfig`, `.tmux.conf`, etc.)
 - `~/.config/` directories for detected apps
 - Editor settings (VS Code, Cursor — including extensions)
+
+### Mac settings details
+
+Selected Mac settings are written to `macos/defaults.json` with the reviewed values. `install.sh` applies them through `scripts/apply-macos-defaults.sh`, which uses typed `defaults write` calls and backs up affected preference domains before writing. Ongoing sync refreshes only the selected entries; it does not add newly discovered settings without another review.
+
+Validate a generated repo with:
+
+```bash
+./scripts/validate.sh --all
+```
+
+The validation script checks that `macos/defaults.json` is valid JSON, uses schema version 1, contains only supported scalar value types, and has an executable apply script.
 
 ### Agentic tools (selective, smart backup)
 Only config files are backed up — never chat history, cache, or logs.

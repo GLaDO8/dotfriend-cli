@@ -21,6 +21,18 @@ cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'JSON'
   "config_dirs": [],
   "editors": {"vscode": false, "cursor": false},
   "dock": {"backup": false, "defaults": false},
+  "macos_defaults": [
+    {
+      "id": "dock.orientation",
+      "domain": "com.apple.dock",
+      "key": "orientation",
+      "scope": "user",
+      "value_type": "string",
+      "value": "left",
+      "risk": "safe",
+      "restart": ["Dock"]
+    }
+  ],
   "xcode": false,
   "telemetry": false,
   "github": {"repo_name": "manifest-repo", "private": true}
@@ -48,6 +60,7 @@ jq -e '.items[] | select(.id == "dotfile:gitconfig" and .repo_path == "config/gi
 jq -e '.items[] | select(.id == "agent_config:codex" and .target_path == "~/.codex")' "$manifest" >/dev/null
 jq -e '.items[] | select(.id == "agent_shared_store:skills" and .repo_path == "agents/skills")' "$manifest" >/dev/null
 jq -e '.items[] | select(.id == "agent_shared_store:agent-docs" and .repo_path == "agents/agent-docs")' "$manifest" >/dev/null
+jq -e '.items[] | select(.id == "macos_defaults:selected" and .restore_mode == "defaults_import" and .repo_path == "macos/defaults.json")' "$manifest" >/dev/null
 
 source "${PROJECT_ROOT}/lib/manifest.sh"
 manifest_validate "$manifest"

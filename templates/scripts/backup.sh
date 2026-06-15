@@ -328,7 +328,97 @@ sync_editor_extensions() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# 5. Sync agent tool configs
+# 5. Sync selected Mac settings
+# ─────────────────────────────────────────────────────────────
+
+macos_defaults_convert_value_json() {
+  local value_type="$1" raw="$2"
+  case "$value_type" in
+    bool)
+      case "$raw" in
+        1|true|TRUE|True|yes|YES|Yes) printf 'true' ;;
+        0|false|FALSE|False|no|NO|No) printf 'false' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    int)
+      jq -cn --arg raw "$raw" '
+        ($raw | tonumber) as $n |
+        if $n == ($n | floor) then ($n | floor) else error("not an integer") end
+      '
+      ;;
+    float) jq -cn --arg raw "$raw" '$raw | tonumber' ;;
+    string) jq -cn --arg raw "$raw" '$raw' ;;
+    *) return 1 ;;
+  esac
+}
+
+macos_defaults_read_value_json() {
+  local domain="$1" key="$2" scope="$3" value_type="$4"
+  local raw_value
+  if [[ "$scope" == "currentHost" ]]; then
+    raw_value="$(defaults -currentHost read "$domain" "$key" 2>/dev/null || true)"
+  else
+    raw_value="$(defaults read "$domain" "$key" 2>/dev/null || true)"
+  fi
+  [[ -n "$raw_value" ]] || return 1
+  raw_value="$(printf '%s' "$raw_value" | sed 's/[[:space:]]*$//')"
+  macos_defaults_convert_value_json "$value_type" "$raw_value"
+}
+
+sync_macos_defaults() {
+  local defaults_file="${REPO_ROOT}/macos/defaults.json"
+  [[ -f "$defaults_file" ]] || return 0
+
+  if ! command -v jq >/dev/null 2>&1; then
+    log_warn "jq not found, skipping Mac settings sync"
+    return 0
+  fi
+
+  log_step "Syncing selected Mac settings"
+
+  local updated_json entry_json changed=false
+  updated_json="$(jq -c '.' "$defaults_file")"
+  while IFS= read -r entry_json; do
+    [[ -n "$entry_json" ]] || continue
+
+    local id domain key scope value_type old_value_json value_json
+    id="$(jq -r '.id' <<< "$entry_json")"
+    domain="$(jq -r '.domain' <<< "$entry_json")"
+    key="$(jq -r '.key' <<< "$entry_json")"
+    scope="$(jq -r '.scope // "user"' <<< "$entry_json")"
+    value_type="$(jq -r '.value_type' <<< "$entry_json")"
+    old_value_json="$(jq -c '.value' <<< "$entry_json")"
+    value_json="$(macos_defaults_read_value_json "$domain" "$key" "$scope" "$value_type")" || {
+      log_warn "Mac setting not found: ${id}"
+      continue
+    }
+
+    if [[ "$old_value_json" != "$value_json" ]]; then
+      changed=true
+      updated_json="$(jq -c --arg id "$id" --argjson value "$value_json" '(.entries[] | select(.id == $id) | .value) = $value' <<< "$updated_json")"
+    fi
+  done < <(jq -c '.entries[]?' "$defaults_file")
+
+  if [[ "$changed" != true ]]; then
+    log_info "Mac settings unchanged"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == true ]]; then
+    printf "${C_DIM}   would regenerate: %s${C_RESET}\n" "$defaults_file"
+    CHANGES_MADE=true
+    return 0
+  fi
+
+  jq --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" '.generated_at = $generated_at' <<< "$updated_json" > "${defaults_file}.tmp"
+  mv "${defaults_file}.tmp" "$defaults_file"
+  CHANGES_MADE=true
+  log_ok "Mac settings updated"
+}
+
+# ─────────────────────────────────────────────────────────────
+# 6. Sync agent tool configs
 # ─────────────────────────────────────────────────────────────
 
 sync_agents() {
@@ -460,7 +550,7 @@ sync_agents() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# 6. Sync dotfiles at repo root
+# 7. Sync dotfiles at repo root
 # ─────────────────────────────────────────────────────────────
 
 sync_dotfiles() {
@@ -481,7 +571,7 @@ sync_dotfiles() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# 6. Diff summary
+# 8. Diff summary
 # ─────────────────────────────────────────────────────────────
 
 show_diff() {
@@ -512,7 +602,7 @@ show_diff() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# 7. Auto-commit
+# 9. Auto-commit
 # ─────────────────────────────────────────────────────────────
 
 auto_commit() {
@@ -565,6 +655,7 @@ sync_configs
 sync_brewfile
 sync_npm
 sync_editor_extensions
+sync_macos_defaults
 sync_agents
 sync_dotfiles
 show_diff

@@ -50,6 +50,7 @@ ${C_BOLD}${C_CYAN}dotfriend${C_RESET} — Generate and maintain your dotfiles re
 
 ${C_BOLD}Usage:${C_RESET}
   dotfriend start          Interactive first-run wizard
+  dotfriend generate       Backend-safe repository generation
   dotfriend sync           Incremental sync
   dotfriend agent status --json  Agent artifact backend status
   dotfriend --help         Show this help
@@ -59,6 +60,9 @@ ${C_BOLD}Sync flags:${C_RESET}
   dotfriend sync --dry-run      Preview changes without applying
   dotfriend sync --no-commit    Apply changes but don't commit
   dotfriend sync --quick        Non-interactive config sync only
+
+${C_BOLD}Backend-safe generate flags:${C_RESET}
+  dotfriend generate --events --target <path> --no-push --force
 EOF
 }
 
@@ -151,6 +155,68 @@ case "${cmd}" in
     # shellcheck source=lib/generate.sh
     source "${LIB_DIR}/generate.sh"
     generate_repo "" "$dry_run"
+    ;;
+
+  generate)
+    if [[ "${DOTFRIEND_API_EVENTS}" != "true" ]]; then
+      api_fail "generate" "events_required" "Use dotfriend generate --events --target <path>."
+      exit 2
+    fi
+
+    target_dir=""
+    no_push=false
+    force=false
+    while [[ ${#args[@]} -gt 0 ]]; do
+      case "${args[0]}" in
+        --target)
+          if [[ ${#args[@]} -lt 2 || -z "${args[1]}" ]]; then
+            api_fail "generate" "target_required" "Use --target <path>."
+            exit 2
+          fi
+          target_dir="${args[1]}"
+          args=("${args[@]:2}")
+          ;;
+        --no-push)
+          no_push=true
+          args=("${args[@]:1}")
+          ;;
+        --force)
+          force=true
+          args=("${args[@]:1}")
+          ;;
+        *)
+          api_fail "generate" "unknown_generate_flag" "Unknown generate flag: ${args[0]}"
+          exit 2
+          ;;
+      esac
+    done
+
+    if [[ -z "$target_dir" ]]; then
+      api_fail "generate" "target_required" "Use --target <path>."
+      exit 2
+    fi
+
+    # shellcheck source=lib/generate.sh
+    source "${LIB_DIR}/generate.sh"
+    export DOTFRIEND_GENERATE_EVENTS=true
+    export DOTFRIEND_GENERATE_NO_PUSH="$no_push"
+    export DOTFRIEND_GENERATE_FORCE="$force"
+    GEN_EVENTS=true
+    GEN_NO_PUSH="$no_push"
+    GEN_FORCE="$force"
+
+    exec 3>&1
+    GEN_EVENT_FD=3
+    _generate_emit_event "job_started" "$(jq -cn --arg job "generate" --arg target "$target_dir" '{job:$job,target:$target}')"
+    if generate_repo "$target_dir" false >&2; then
+      _generate_emit_event "job_finished" "$(jq -cn --arg job "generate" --arg status "ok" '{job:$job,status:$status}')"
+      exec 3>&-
+      exit 0
+    fi
+    _generate_emit_event "error" '{"code":"generation_failed","message":"Generation failed."}'
+    _generate_emit_event "job_finished" "$(jq -cn --arg job "generate" --arg status "failed" '{job:$job,status:$status}')"
+    exec 3>&-
+    exit 1
     ;;
 
   sync)

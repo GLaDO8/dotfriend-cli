@@ -140,6 +140,19 @@ manifest_write_for_generated_repo() {
         } else empty end)
       ];
 
+    def selected_macos_defaults:
+      if (($selections.macos_defaults // []) | length) > 0 then [
+        {
+          id: "macos_defaults:selected",
+          type: "macos_defaults",
+          restore_mode: "defaults_import",
+          repo_path: "macos/defaults.json",
+          target_path: "~/Library/Preferences",
+          selected: true,
+          requires_approval: false
+        }
+      ] else [] end;
+
     {
       schema_version: 1,
       generated_by: "dotfriend",
@@ -150,6 +163,7 @@ manifest_write_for_generated_repo() {
         + selected_config_dirs
         + selected_agents
         + editor_extensions
+        + selected_macos_defaults
         + [
           {
             id: "agent_shared_store:skills",

@@ -13,6 +13,8 @@ source "${SCRIPT_DIR}/gum.sh"
 source "${SCRIPT_DIR}/api.sh"
 # shellcheck source=manifest.sh
 source "${SCRIPT_DIR}/manifest.sh"
+# shellcheck source=prune.sh
+source "${SCRIPT_DIR}/prune.sh"
 # shellcheck source=discovery.sh
 if [[ -f "${SCRIPT_DIR}/discovery.sh" ]]; then
   source "${SCRIPT_DIR}/discovery.sh"
@@ -285,15 +287,7 @@ _sync_manifest_dir_item() {
 
 _sync_find_files_filtered() {
   local root="$1" filter_profile="${2:-config}"
-  if [[ "$filter_profile" == "config" ]]; then
-    find "$root" \
-      \( -name '.git' -o -name 'node_modules' -o -name 'bower_components' -o -name 'jspm_packages' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name '.build' -o -name 'coverage' -o -name 'vendor' -o -name 'Pods' -o -name '.gradle' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name '.tox' -o -name 'virtenv' -o -name 'venv' -o -name '.venv' -o -name 'virtualenv' -o -name 'gcloud' -o -name '.gcloud' -o -name '.cache' -o -name 'cache' -o -name 'Cache' -o -name 'Caches' -o -name '.npm' -o -name '.pnpm-store' -o -name '.yarn' -o -name 'tmp' -o -name 'temp' -o -name 'logs' -o -name 'log' -o -name 'marketplace' -o -name 'marketplaces' -o -name 'plugin-marketplace' -o -name 'plugin-marketplaces' -o -name 'sessions' -o -name 'archived_sessions' -o -name 'generated' -o -name '.generated' -o -name 'generated_images' -o -name 'sqlite' -o -name '.turbo' -o -name '.parcel-cache' -o -name '.vite' -o -name '.nuxt' -o -name '.svelte-kit' -o -name '.astro' -o -name 'extensions' \) \
-      -prune -o -type f -print0 2>/dev/null || true
-  else
-    find "$root" \
-      \( -name '.git' -o -name 'node_modules' -o -name 'bower_components' -o -name 'jspm_packages' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name '.build' -o -name 'coverage' -o -name 'vendor' -o -name 'Pods' -o -name '.gradle' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name '.tox' -o -name 'virtenv' -o -name 'venv' -o -name '.venv' -o -name 'virtualenv' -o -name 'gcloud' -o -name '.gcloud' -o -name '.cache' -o -name 'cache' -o -name 'Cache' -o -name 'Caches' -o -name '.npm' -o -name '.pnpm-store' -o -name '.yarn' -o -name 'tmp' -o -name 'temp' -o -name 'logs' -o -name 'log' -o -name 'marketplace' -o -name 'marketplaces' -o -name 'plugin-marketplace' -o -name 'plugin-marketplaces' -o -name 'sessions' -o -name 'archived_sessions' -o -name 'generated' -o -name '.generated' -o -name 'generated_images' -o -name 'sqlite' -o -name '.turbo' -o -name '.parcel-cache' -o -name '.vite' -o -name '.nuxt' -o -name '.svelte-kit' -o -name '.astro' \) \
-      -prune -o -type f -print0 2>/dev/null || true
-  fi
+  dotfriend_find_files_filtered "$root" "$filter_profile"
 }
 
 _sync_manifest_path_is_skipped() {
@@ -342,6 +336,347 @@ _sync_manifest_agent_config_item() {
   done < <(jq -r '.metadata.important_dirs // [] | .[]' <<< "$item_json" 2>/dev/null || true)
 }
 
+_sync_jobs() {
+  local jobs="${DOTFRIEND_SYNC_JOBS:-4}"
+  if [[ ! "$jobs" =~ ^[0-9]+$ || "$jobs" -lt 1 ]]; then
+    jobs=4
+  fi
+  printf '%s' "$jobs"
+}
+
+_sync_apply_jobs() {
+  local jobs="${DOTFRIEND_SYNC_APPLY_JOBS:-2}"
+  if [[ ! "$jobs" =~ ^[0-9]+$ || "$jobs" -lt 1 ]]; then
+    jobs=2
+  fi
+  printf '%s' "$jobs"
+}
+
+_sync_plan_line() {
+  local sort_key="$1" item_id="$2" item_type="$3" change="$4" code="$5" repo_path="$6" target_path="$7" message="$8" op="$9" live_path="${10:-}" repo_file="${11:-}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$sort_key" "$item_id" "$item_type" "$change" "$code" "$repo_path" "$target_path" "$message" "$op" "$live_path" "$repo_file"
+}
+
+_sync_manifest_plan_file_item() {
+  local item_id="$1" item_type="$2" repo_path="$3" target_path="$4"
+  local repo_source="${REPO_DIR}/${repo_path}"
+  local live_target
+  live_target="$(_expand_home_path "$target_path")"
+
+  if [[ ! -e "$live_target" ]]; then
+    _sync_plan_line "$repo_path" "$item_id" "$item_type" "missing_live_target" "missing_live_target" "$repo_path" "$target_path" "Live target is missing." "none" "$live_target" "$repo_source"
+    return 0
+  fi
+
+  if [[ -d "$live_target" ]]; then
+    return 0
+  fi
+
+  if [[ ! -e "$repo_source" ]]; then
+    _sync_plan_line "$repo_path" "$item_id" "$item_type" "add" "missing_repo_source" "$repo_path" "$target_path" "Managed repo source is missing." "copy_file" "$live_target" "$repo_source"
+    return 0
+  fi
+
+  if _sync_files_differ "$repo_source" "$live_target"; then
+    _sync_plan_line "$repo_path" "$item_id" "$item_type" "update" "changed_live_file" "$repo_path" "$target_path" "Live file differs from repo source." "copy_file" "$live_target" "$repo_source"
+  fi
+}
+
+_sync_manifest_plan_dir_item() {
+  local item_id="$1" item_type="$2" repo_path="$3" target_path="$4"
+  local filter_profile="${5:-config}"
+  local repo_source="${REPO_DIR}/${repo_path}"
+  local live_target
+  live_target="$(_expand_home_path "$target_path")"
+
+  if [[ ! -d "$live_target" ]]; then
+    _sync_plan_line "$repo_path" "$item_id" "$item_type" "missing_live_target" "missing_live_target" "$repo_path" "$target_path" "Live target is missing." "none" "$live_target" "$repo_source"
+    return 0
+  fi
+
+  if [[ ! -d "$repo_source" ]]; then
+    _sync_plan_line "$repo_path" "$item_id" "$item_type" "add" "missing_repo_source" "$repo_path" "$target_path" "Managed repo source is missing." "mkdir" "$live_target" "$repo_source"
+  fi
+
+  while IFS= read -r -d '' live_file; do
+    local rel_path="${live_file#${live_target}/}"
+    local repo_file="${repo_source}/${rel_path}"
+    local event_repo_path="${repo_path}/${rel_path}"
+    local event_target_path="${target_path}/${rel_path}"
+
+    if [[ ! -e "$repo_file" ]]; then
+      _sync_plan_line "$event_repo_path" "$item_id" "$item_type" "add" "missing_repo_source" "$event_repo_path" "$event_target_path" "Managed repo source is missing." "copy_file" "$live_file" "$repo_file"
+      continue
+    fi
+
+    if _sync_files_differ "$repo_file" "$live_file"; then
+      _sync_plan_line "$event_repo_path" "$item_id" "$item_type" "update" "changed_live_file" "$event_repo_path" "$event_target_path" "Live file differs from repo source." "copy_file" "$live_file" "$repo_file"
+    fi
+  done < <(_sync_find_files_filtered "$live_target" "$filter_profile")
+
+  if [[ -d "$repo_source" ]]; then
+    while IFS= read -r -d '' repo_file; do
+      local rel_path="${repo_file#${repo_source}/}"
+      local live_file="${live_target}/${rel_path}"
+      if [[ ! -e "$live_file" ]]; then
+        _sync_plan_line "${repo_path}/${rel_path}" "$item_id" "$item_type" "repo_only" "changed_repo_file" "${repo_path}/${rel_path}" "${target_path}/${rel_path}" "Repo file has no live counterpart." "none" "$live_file" "$repo_file"
+      fi
+    done < <(_sync_find_files_filtered "$repo_source" "$filter_profile")
+  fi
+}
+
+_sync_manifest_plan_agent_config_item() {
+  local item_id="$1" repo_path="$2" target_path="$3" item_json="$4"
+  local live_root
+  live_root="$(_expand_home_path "$target_path")"
+
+  if [[ ! -d "$live_root" ]]; then
+    _sync_plan_line "$repo_path" "$item_id" "agent_config" "missing_live_target" "missing_live_target" "$repo_path" "$target_path" "Live target is missing." "none" "$live_root" "${REPO_DIR}/${repo_path}"
+    return 0
+  fi
+
+  local symlinks_to_skip
+  symlinks_to_skip="$(jq -r '.metadata.symlinks_to_skip // [] | .[]' <<< "$item_json" 2>/dev/null || true)"
+
+  local rel_path live_path
+  while IFS= read -r rel_path; do
+    [[ -n "$rel_path" ]] || continue
+    live_path="${live_root}/${rel_path}"
+    if [[ -L "$live_path" ]] || _sync_manifest_path_is_skipped "$live_path" "$symlinks_to_skip"; then
+      continue
+    fi
+    _sync_manifest_plan_file_item "${item_id}:${rel_path}" "agent_config" "${repo_path}/${rel_path}" "${target_path}/${rel_path}"
+  done < <(jq -r '.metadata.important_files // [] | .[]' <<< "$item_json" 2>/dev/null || true)
+
+  while IFS= read -r rel_path; do
+    [[ -n "$rel_path" ]] || continue
+    live_path="${live_root}/${rel_path}"
+    if [[ -L "$live_path" ]] || _sync_manifest_path_is_skipped "$live_path" "$symlinks_to_skip"; then
+      continue
+    fi
+    _sync_manifest_plan_dir_item "${item_id}:${rel_path}" "agent_config" "${repo_path}/${rel_path}" "${target_path}/${rel_path}" "agent"
+  done < <(jq -r '.metadata.important_dirs // [] | .[]' <<< "$item_json" 2>/dev/null || true)
+}
+
+_sync_manifest_plan_item() {
+  local item_json="$1"
+  local item_id item_type repo_path target_path restore_mode
+  item_id="$(jq -r '.id' <<< "$item_json")"
+  item_type="$(jq -r '.type // empty' <<< "$item_json")"
+  repo_path="$(jq -r '.repo_path // empty' <<< "$item_json")"
+  target_path="$(jq -r '.target_path // empty' <<< "$item_json")"
+  restore_mode="$(jq -r '.restore_mode // empty' <<< "$item_json")"
+
+  [[ -n "$repo_path" && -n "$target_path" ]] || return 0
+
+  if [[ "$item_type" == "agent_config" ]]; then
+    _sync_manifest_plan_agent_config_item "$item_id" "$repo_path" "$target_path" "$item_json"
+    return 0
+  fi
+
+  case "$restore_mode" in
+    copy|rsync)
+      _sync_manifest_plan_dir_item "$item_id" "$item_type" "$repo_path" "$target_path"
+      ;;
+    symlink|managed_json_merge|managed_markdown_block)
+      _sync_manifest_plan_file_item "$item_id" "$item_type" "$repo_path" "$target_path"
+      ;;
+    defaults_import)
+      ;;
+    *)
+      ;;
+  esac
+}
+
+_sync_manifest_build_action_plan() {
+  local manifest_file="$1" plan_file="$2" jobs
+  jobs="$(_sync_jobs)"
+  local plan_dir
+  plan_dir="$(mktemp -d)"
+  local -a pids=()
+  local batch_count=0 index=0 item_json
+
+  while IFS= read -r item_json; do
+    [[ -n "$item_json" ]] || continue
+    (
+      _sync_manifest_plan_item "$item_json"
+    ) > "${plan_dir}/$(printf '%04d' "$index").tsv" &
+    pids+=("$!")
+    batch_count=$((batch_count + 1))
+    index=$((index + 1))
+    if [[ "$batch_count" -ge "$jobs" ]]; then
+      local pid
+      for pid in "${pids[@]}"; do
+        wait "$pid"
+      done
+      pids=()
+      batch_count=0
+    fi
+  done < <(jq -c '.items[]? | select(.selected != false)' "$manifest_file")
+
+  if [[ ${#pids[@]} -gt 0 ]]; then
+    local pid
+    for pid in "${pids[@]}"; do
+      wait "$pid"
+    done
+  fi
+
+  if compgen -G "${plan_dir}/*.tsv" >/dev/null; then
+    cat "${plan_dir}"/*.tsv | LC_ALL=C sort -t $'\t' -k1,1 -k2,2 > "$plan_file"
+  else
+    : > "$plan_file"
+  fi
+  rm -rf "$plan_dir"
+}
+
+_sync_action_applies_metadata() {
+  local item_id="$1" change="$2" code="$3" repo_path="$4" target_path="$5" message="$6"
+  _sync_add_drift "$code" "$item_id" "$repo_path" "$target_path" "$message"
+  _sync_item_changed "$item_id" "$change" "$repo_path" "$target_path" "$code"
+}
+
+_sync_emit_item_actions_from_plan() {
+  local plan_file="$1" item_id="$2"
+  local sort_key action_item_id item_type change code repo_path target_path message op live_file repo_file
+  while IFS=$'\t' read -r sort_key action_item_id item_type change code repo_path target_path message op live_file repo_file; do
+    [[ -n "${sort_key:-}" ]] || continue
+    if [[ "$action_item_id" == "$item_id" || "$action_item_id" == "${item_id}:"* ]]; then
+      _sync_action_applies_metadata "$action_item_id" "$change" "$code" "$repo_path" "$target_path" "$message"
+    fi
+  done < "$plan_file"
+}
+
+_sync_apply_one_action() {
+  local op="$1" live_file="$2" repo_file="$3"
+  case "$op" in
+    copy_file)
+      ensure_dir "$(dirname "$repo_file")"
+      cp -a "$live_file" "$repo_file"
+      ;;
+    mkdir)
+      ensure_dir "$repo_file"
+      ;;
+    *)
+      ;;
+  esac
+}
+
+_sync_apply_action_plan() {
+  local plan_file="$1" jobs
+  [[ "$DRY_RUN" != true ]] || return 0
+  jobs="$(_sync_apply_jobs)"
+  local -a pids=()
+  local batch_count=0 sort_key item_id item_type change code repo_path target_path message op live_file repo_file
+
+  while IFS=$'\t' read -r sort_key item_id item_type change code repo_path target_path message op live_file repo_file; do
+    [[ -n "${sort_key:-}" ]] || continue
+    case "$op" in
+      copy_file|mkdir)
+        (_sync_apply_one_action "$op" "$live_file" "$repo_file") &
+        pids+=("$!")
+        batch_count=$((batch_count + 1))
+        if [[ "$batch_count" -ge "$jobs" ]]; then
+          local pid
+          for pid in "${pids[@]}"; do
+            wait "$pid"
+          done
+          pids=()
+          batch_count=0
+        fi
+        ;;
+      *)
+        ;;
+    esac
+  done < "$plan_file"
+
+  if [[ ${#pids[@]} -gt 0 ]]; then
+    local pid
+    for pid in "${pids[@]}"; do
+      wait "$pid"
+    done
+  fi
+}
+
+_sync_macos_defaults_source_json() {
+  local repo_file="$1"
+  local selections_file="${REPO_DIR}/.dotfriend/selections.json"
+
+  if [[ -f "$repo_file" ]]; then
+    jq -c '.' "$repo_file"
+    return 0
+  fi
+
+  if [[ -f "$selections_file" ]]; then
+    jq -cn \
+      --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+      --slurpfile selections_file "$selections_file" \
+      '{schema_version:1,generated_by:"dotfriend",generated_at:$generated_at,catalog_version:"",entries:($selections_file[0].macos_defaults // [])}'
+    return 0
+  fi
+
+  return 1
+}
+
+_sync_manifest_macos_defaults_item() {
+  local item_id="$1" repo_path="$2" target_path="$3"
+  local repo_file="${REPO_DIR}/${repo_path}"
+
+  if ! command -v jq >/dev/null 2>&1; then
+    _sync_warning "macos_defaults_jq_missing" "jq is required to sync selected Mac settings." "{}"
+    return 0
+  fi
+
+  local source_json updated_json entry_json changed=false missing_count=0
+  if ! source_json="$(_sync_macos_defaults_source_json "$repo_file")"; then
+    _sync_add_drift "missing_repo_source" "$item_id" "$repo_path" "$target_path" "Selected Mac settings file is missing."
+    _sync_item_changed "$item_id" "missing_repo_source" "$repo_path" "$target_path" "missing_repo_source"
+    return 0
+  fi
+
+  updated_json="$source_json"
+  while IFS= read -r entry_json; do
+    [[ -n "$entry_json" ]] || continue
+
+    local id domain key scope value_type old_value_json value_json status
+    id="$(jq -r '.id' <<< "$entry_json")"
+    domain="$(jq -r '.domain' <<< "$entry_json")"
+    key="$(jq -r '.key' <<< "$entry_json")"
+    scope="$(jq -r '.scope // "user"' <<< "$entry_json")"
+    value_type="$(jq -r '.value_type' <<< "$entry_json")"
+    old_value_json="$(jq -c '.value' <<< "$entry_json")"
+    status=0
+    value_json="$(macos_defaults_read_value_json "$domain" "$key" "$scope" "$value_type")" || status=$?
+
+    if [[ "$status" == "0" ]]; then
+      if [[ "$old_value_json" != "$value_json" ]]; then
+        changed=true
+      fi
+      updated_json="$(jq -c --arg id "$id" --argjson value "$value_json" '(.entries[] | select(.id == $id) | .value) = $value' <<< "$updated_json")"
+    else
+      ((missing_count++)) || true
+    fi
+  done < <(jq -c '.entries[]?' <<< "$source_json")
+
+  if [[ "$changed" == true ]]; then
+    local tmpfile
+    tmpfile="$(mktemp)"
+    jq -c --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" '.generated_at = $generated_at' <<< "$updated_json" > "$tmpfile"
+    _sync_add_drift "changed_live_macos_defaults" "$item_id" "$repo_path" "$target_path" "Selected Mac settings changed on this Mac."
+    _sync_item_changed "$item_id" "update" "$repo_path" "$target_path" "changed_live_macos_defaults"
+    if [[ "$DRY_RUN" != true ]]; then
+      ensure_dir "$(dirname "$repo_file")"
+      mv "$tmpfile" "$repo_file"
+    else
+      rm -f "$tmpfile"
+    fi
+  fi
+
+  if [[ "$missing_count" -gt 0 ]]; then
+    _sync_warning "macos_defaults_missing_values" "Some selected Mac settings were not found during sync." "$(jq -cn --argjson missing "$missing_count" '{missing:$missing}')"
+  fi
+}
+
 _sync_manifest_untracked_discovered_configs() {
   local manifest_file="$1"
   local discovery_file="${DOTFRIEND_CACHE_DIR}/discovery.json"
@@ -369,9 +704,11 @@ _sync_manifest_untracked_discovered_configs() {
 
 sync_manifest_owned_paths() {
   local manifest_file="$1"
-  local item_json item_id item_type repo_path target_path restore_mode
+  local item_json item_id item_type repo_path target_path restore_mode plan_file
 
   _sync_emit_event "step_started" '{"step":"manifest_sync","label":"Syncing manifest-owned paths"}'
+  plan_file="$(mktemp)"
+  _sync_manifest_build_action_plan "$manifest_file" "$plan_file"
 
   while IFS= read -r item_json; do
     [[ -n "$item_json" ]] || continue
@@ -393,26 +730,17 @@ sync_manifest_owned_paths() {
       --arg target_path "$target_path" \
       '{item_id:$item_id,item_type:$item_type,repo_path:$repo_path,target_path:$target_path}')"
 
-    if [[ "$item_type" == "agent_config" ]]; then
-      _sync_manifest_agent_config_item "$item_id" "$repo_path" "$target_path" "$item_json"
-      _sync_manifest_item_finished "$item_id" "$item_type" "$repo_path" "$target_path" "$item_started_at" "$item_changes_before" "$item_drift_before"
-      continue
+    if [[ "$item_type" == "macos_defaults" || "$restore_mode" == "defaults_import" ]]; then
+      _sync_manifest_macos_defaults_item "$item_id" "$repo_path" "$target_path"
+    else
+      _sync_emit_item_actions_from_plan "$plan_file" "$item_id"
     fi
-
-    case "$restore_mode" in
-      copy|rsync)
-        _sync_manifest_dir_item "$item_id" "$repo_path" "$target_path"
-        ;;
-      symlink|managed_json_merge|managed_markdown_block|defaults_import)
-        _sync_manifest_file_item "$item_id" "$repo_path" "$target_path"
-        ;;
-      *)
-        ;;
-    esac
     _sync_manifest_item_finished "$item_id" "$item_type" "$repo_path" "$target_path" "$item_started_at" "$item_changes_before" "$item_drift_before"
   done < <(jq -c '.items[]? | select(.selected != false)' "$manifest_file")
 
   _sync_manifest_untracked_discovered_configs "$manifest_file"
+  _sync_apply_action_plan "$plan_file"
+  rm -f "$plan_file"
 
   _sync_emit_event "step_finished" "$(jq -cn --arg step "manifest_sync" --arg status "ok" --argjson counts "$(jq -cn --argjson drift "$SYNC_DRIFT_JSON" --argjson changes "$SYNC_CHANGE_COUNT" '{drift:($drift|length),changes:$changes}')" '{step:$step,status:$status,counts:$counts}')"
 
@@ -600,7 +928,7 @@ sync_brewfile() {
 
   # Taps
   local current_taps tracked_taps tap
-  current_taps="$(brew tap 2>/dev/null || true)"
+  current_taps="$(dotfriend_run_optional_command brew tap || true)"
   tracked_taps="$(_brewfile_section_items "$brewfile" tap)"
   while IFS= read -r tap; do
     [[ -z "$tap" ]] && continue
@@ -611,7 +939,7 @@ sync_brewfile() {
 
   # Formulae
   local current_formulae tracked_formulae formula
-  current_formulae="$(brew list --formula 2>/dev/null || true)"
+  current_formulae="$(dotfriend_run_optional_command brew list --formula || true)"
   tracked_formulae="$(_brewfile_section_items "$brewfile" brew)"
   while IFS= read -r formula; do
     [[ -z "$formula" ]] && continue
@@ -622,7 +950,7 @@ sync_brewfile() {
 
   # Casks
   local current_casks tracked_casks cask
-  current_casks="$(brew list --cask 2>/dev/null || true)"
+  current_casks="$(dotfriend_run_optional_command brew list --cask || true)"
   tracked_casks="$(_brewfile_section_items "$brewfile" cask)"
   while IFS= read -r cask; do
     [[ -z "$cask" ]] && continue
@@ -634,7 +962,7 @@ sync_brewfile() {
   # MAS apps
   local current_mas tracked_mas mas_line mas_id mas_name
   if command -v mas >/dev/null 2>&1; then
-    current_mas="$(mas list 2>/dev/null || true)"
+    current_mas="$(dotfriend_run_optional_command mas list || true)"
     tracked_mas="$(_brewfile_section_items "$brewfile" mas)"
     while IFS= read -r mas_line; do
       [[ -z "$mas_line" ]] && continue
@@ -764,7 +1092,7 @@ sync_npm() {
   fi
 
   local current current_name new_packages=()
-  current="$(npm list -g --depth=0 --json 2>/dev/null | node -e '
+  current="$(dotfriend_run_optional_command npm list -g --depth=0 --json | node -e '
     const data = JSON.parse(require("fs").readFileSync(0, "utf-8"));
     const deps = data.dependencies || {};
     Object.keys(deps).forEach(k => console.log(k + "@" + (deps[k].version || "")));
@@ -823,6 +1151,36 @@ sync_npm() {
 # Editor extension sync
 # ─────────────────────────────────────────────────────────────
 
+_sync_editor_extensions_from_cache() {
+  local editor_id="$1" target_file="$2" display_name="$3"
+  local extensions tmpfile
+  extensions="$(dotfriend_cached_editor_extensions "$editor_id" || true)"
+  [[ -n "$extensions" ]] || return 1
+
+  tmpfile="$(mktemp)"
+  printf '%s\n' "$extensions" | sort -u > "$tmpfile"
+
+  if [[ "$DRY_RUN" == true ]]; then
+    if [[ ! -f "$target_file" ]] || _sync_files_differ "$target_file" "$tmpfile"; then
+      gum_style --foreground "#F1FA8C" "  [dry-run] Would update ${editor_id}/extensions.txt"
+    else
+      log_ok "${display_name} extensions are up to date."
+    fi
+    rm -f "$tmpfile"
+    return 0
+  fi
+
+  ensure_dir "$(dirname "$target_file")"
+  if [[ ! -f "$target_file" ]] || _sync_files_differ "$target_file" "$tmpfile"; then
+    mv "$tmpfile" "$target_file"
+    log_ok "Updated ${editor_id}/extensions.txt from cached discovery"
+  else
+    rm -f "$tmpfile"
+    log_ok "${display_name} extensions are up to date."
+  fi
+  return 0
+}
+
 sync_editor_extensions() {
   log_step "Editor Extension Sync"
 
@@ -831,10 +1189,12 @@ sync_editor_extensions() {
 
   if [[ -d "${REPO_DIR}/vscode" ]]; then
     synced_any=true
-    if command -v code >/dev/null 2>&1; then
-      target_file="${REPO_DIR}/vscode/extensions.txt"
+    target_file="${REPO_DIR}/vscode/extensions.txt"
+    if _sync_editor_extensions_from_cache vscode "$target_file" "VS Code"; then
+      true
+    elif command -v code >/dev/null 2>&1; then
       tmpfile="$(mktemp)"
-      code --list-extensions 2>/dev/null | sort > "$tmpfile"
+      dotfriend_run_optional_command code --list-extensions | sort > "$tmpfile" || true
 
       if [[ "$DRY_RUN" == true ]]; then
         if [[ ! -f "$target_file" ]] || _sync_files_differ "$target_file" "$tmpfile"; then
@@ -861,10 +1221,12 @@ sync_editor_extensions() {
 
   if [[ -d "${REPO_DIR}/cursor" ]]; then
     synced_any=true
-    if command -v cursor >/dev/null 2>&1; then
-      target_file="${REPO_DIR}/cursor/extensions.txt"
+    target_file="${REPO_DIR}/cursor/extensions.txt"
+    if _sync_editor_extensions_from_cache cursor "$target_file" "Cursor"; then
+      true
+    elif command -v cursor >/dev/null 2>&1; then
       tmpfile="$(mktemp)"
-      cursor --list-extensions 2>/dev/null | sort > "$tmpfile"
+      dotfriend_run_optional_command cursor --list-extensions | sort > "$tmpfile" || true
 
       if [[ "$DRY_RUN" == true ]]; then
         if [[ ! -f "$target_file" ]] || _sync_files_differ "$target_file" "$tmpfile"; then
@@ -1123,7 +1485,7 @@ cmd_sync() {
     fi
   fi
 
-  _sync_emit_event "job_started" '{"job":"sync"}'
+  _sync_emit_event "job_started" "$(jq -cn --arg job "sync" --argjson sync_jobs "$(_sync_jobs)" '{job:$job,sync_jobs:$sync_jobs}')"
 
   # Resolve repo directory
   REPO_DIR="$(_find_repo)" || true

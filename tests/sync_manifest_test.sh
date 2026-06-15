@@ -18,6 +18,7 @@ mkdir -p \
   "$REPO_DIR/.dotfriend" \
   "$REPO_DIR/codex" \
   "$REPO_DIR/config/zed" \
+  "$REPO_DIR/macos" \
   "$FAKE_BIN"
 
 export HOME="$HOME_DIR"
@@ -72,6 +73,30 @@ exec /usr/bin/diff "$@"
 SH
 chmod +x "${FAKE_BIN}/diff"
 
+cat > "${FAKE_BIN}/code" <<'SH'
+#!/usr/bin/env bash
+printf 'code CLI should not run during cached quick sync\n' >&2
+exit 44
+SH
+cat > "${FAKE_BIN}/cursor" <<'SH'
+#!/usr/bin/env bash
+printf 'cursor CLI should not run during cached quick sync\n' >&2
+exit 45
+SH
+chmod +x "${FAKE_BIN}/code" "${FAKE_BIN}/cursor"
+
+cat > "${FAKE_BIN}/defaults" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  "read-type com.apple.dock orientation") printf 'Type is string\n' ;;
+  "read com.apple.dock orientation") printf '%s\n' "${DEFAULTS_ORIENTATION:-right}" ;;
+  *) exit 1 ;;
+esac
+SH
+chmod +x "${FAKE_BIN}/defaults"
+export DEFAULTS_ORIENTATION="right"
+
 cat > "${DOTFRIEND_CACHE_DIR}/last-sync.json" <<JSON
 {"repo_dir":"${REPO_DIR}","last_sync":"2026-05-05T00:00:00Z"}
 JSON
@@ -82,7 +107,11 @@ cat > "${DOTFRIEND_CACHE_DIR}/discovery.json" <<'JSON'
   "config_dirs": [
     {"name": "zed", "path": "~/.config/zed"},
     {"name": "unselected", "path": "~/.config/unselected"}
-  ]
+  ],
+  "editors": {
+    "vscode": {"settings_path": "", "extensions": ["cached.vscode"]},
+    "cursor": {"settings_path": "", "extensions": ["cached.cursor"]}
+  }
 }
 JSON
 
@@ -105,6 +134,36 @@ printf 'session cache\n' > "${HOME_DIR}/.codex/cache/session.log"
 printf 'repo stale\n' > "${REPO_DIR}/config/zed/settings.json"
 printf 'repo only\n' > "${REPO_DIR}/config/zed/repo-only.json"
 printf 'do not copy\n' > "${HOME_DIR}/.config/unselected/settings.json"
+cat > "${REPO_DIR}/macos/defaults.json" <<'JSON'
+{
+  "schema_version": 1,
+  "generated_by": "dotfriend",
+  "generated_at": "2026-05-05T00:00:00Z",
+  "catalog_version": "test",
+  "entries": [
+    {
+      "id": "dock.orientation",
+      "domain": "com.apple.dock",
+      "key": "orientation",
+      "scope": "user",
+      "value_type": "string",
+      "value": "left",
+      "risk": "safe",
+      "restart": ["Dock"]
+    },
+    {
+      "id": "finder.missing",
+      "domain": "com.apple.finder",
+      "key": "MissingKey",
+      "scope": "user",
+      "value_type": "bool",
+      "value": true,
+      "risk": "safe",
+      "restart": ["Finder"]
+    }
+  ]
+}
+JSON
 
 cat > "${REPO_DIR}/.dotfriend/restore-manifest.json" <<'JSON'
 {
@@ -144,6 +203,15 @@ cat > "${REPO_DIR}/.dotfriend/restore-manifest.json" <<'JSON'
         "important_dirs": ["agent-docs", "plugins"],
         "symlinks_to_skip": []
       }
+    },
+    {
+      "id": "macos_defaults:selected",
+      "type": "macos_defaults",
+      "restore_mode": "defaults_import",
+      "repo_path": "macos/defaults.json",
+      "target_path": "~/Library/Preferences",
+      "selected": true,
+      "requires_approval": false
     }
   ],
   "manual_followups": []
@@ -162,6 +230,10 @@ if [[ "$(cat "${REPO_DIR}/config/zed/settings.json")" != "repo stale" ]]; then
 fi
 if [[ -e "${REPO_DIR}/config/unselected/settings.json" ]]; then
   printf 'dry-run copied unselected config dir\n' >&2
+  exit 1
+fi
+if [[ "$(jq -r '.entries[] | select(.id == "dock.orientation") | .value' "${REPO_DIR}/macos/defaults.json")" != "left" ]]; then
+  printf 'dry-run mutated selected Mac settings\n' >&2
   exit 1
 fi
 if [[ -e "${REPO_DIR}/config/zed/extensions/cache.txt" ]]; then
@@ -194,7 +266,9 @@ events_stderr="${TEST_DIR}/events.stderr"
 "$REAL_JQ" -s -e '.[] | select(.event == "item_changed" and .code == "changed_live_file" and .repo_path == "config/zed/settings.json")' "$events_stdout" >/dev/null
 "$REAL_JQ" -s -e '.[] | select(.event == "item_changed" and .code == "changed_repo_file" and .repo_path == "config/zed/repo-only.json")' "$events_stdout" >/dev/null
 "$REAL_JQ" -s -e '.[] | select(.event == "item_changed" and .code == "untracked_discovered_config" and .item_id == "config_dir:unselected")' "$events_stdout" >/dev/null
+"$REAL_JQ" -s -e '.[] | select(.event == "item_changed" and .code == "changed_live_macos_defaults" and .item_id == "macos_defaults:selected")' "$events_stdout" >/dev/null
 "$REAL_JQ" -s -e '.[] | select(.event == "item_finished" and .item_id == "config_dir:zed" and (.elapsed_seconds | type == "number"))' "$events_stdout" >/dev/null
+"$REAL_JQ" -s -e '.[] | select(.event == "job_started" and .job == "sync" and .sync_jobs == 4)' "$events_stdout" >/dev/null
 if grep -v '^{.*}$' "$events_stdout" >/dev/null; then
   printf 'sync --events stdout contained non-json output\n' >&2
   exit 1
@@ -221,6 +295,18 @@ if [[ -f "$FIND_ROOT_MARKER" ]]; then
 fi
 if [[ "$(cat "${REPO_DIR}/codex/AGENTS.md")" != "# AGENTS" ]]; then
   printf 'app event sync did not copy allowlisted codex file\n' >&2
+  exit 1
+fi
+if [[ "$(jq -r '.entries[] | select(.id == "dock.orientation") | .value' "${REPO_DIR}/macos/defaults.json")" != "right" ]]; then
+  printf 'app event sync did not refresh selected Mac setting\n' >&2
+  exit 1
+fi
+if [[ "$(jq -r '.entries[] | select(.id == "finder.missing") | .value' "${REPO_DIR}/macos/defaults.json")" != "true" ]]; then
+  printf 'app event sync deleted or changed missing selected Mac setting\n' >&2
+  exit 1
+fi
+if jq -e '.entries[] | select(.id == "safari.unreviewed")' "${REPO_DIR}/macos/defaults.json" >/dev/null; then
+  printf 'app event sync added unreviewed Mac setting\n' >&2
   exit 1
 fi
 if [[ "$(cat "${REPO_DIR}/codex/plugins/custom/plugin.json")" != "custom plugin" ]]; then
@@ -265,7 +351,7 @@ fi
 rm -rf "${REPO_DIR}/.git"
 
 legacy_repo="${TEST_DIR}/legacy-dotfiles"
-mkdir -p "$legacy_repo/config/zed"
+mkdir -p "$legacy_repo/config/zed" "$legacy_repo/vscode" "$legacy_repo/cursor"
 printf 'legacy repo stale\n' > "${legacy_repo}/config/zed/settings.json"
 cat > "${DOTFRIEND_CACHE_DIR}/last-sync.json" <<JSON
 {"repo_dir":"${legacy_repo}","last_sync":"2026-05-05T00:00:00Z"}
@@ -275,5 +361,9 @@ legacy_events="${TEST_DIR}/legacy-events.stdout"
 "${PROJECT}/dotfriend" --no-bootstrap sync --dry-run --quick --events >"$legacy_events" 2>"${TEST_DIR}/legacy-events.stderr"
 "$REAL_JQ" -s -e '.[] | select(.event == "warning" and .code == "manifest_missing")' "$legacy_events" >/dev/null
 "$REAL_JQ" -s -e '.[] | select(.event == "job_finished" and .status == "warning")' "$legacy_events" >/dev/null
+if grep -q 'CLI should not run' "${TEST_DIR}/legacy-events.stderr"; then
+  printf 'quick legacy sync invoked editor CLI despite cached discovery extensions\n' >&2
+  exit 1
+fi
 
 printf 'sync manifest contract ok\n'

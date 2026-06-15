@@ -13,8 +13,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/gum.sh"
 # shellcheck source=manifest.sh
 source "$(dirname "${BASH_SOURCE[0]}")/manifest.sh"
 
+# shellcheck source=api.sh
+source "$(dirname "${BASH_SOURCE[0]}")/api.sh"
+
 # shellcheck source=agent-artifacts.sh
 source "$(dirname "${BASH_SOURCE[0]}")/agent-artifacts.sh"
+
+# shellcheck source=prune.sh
+source "$(dirname "${BASH_SOURCE[0]}")/prune.sh"
 
 # ─────────────────────────────────────────────────────────────
 # Paths
@@ -34,6 +40,88 @@ GEN_DRY_RUN="false"
 GEN_GITHUB_BACKED_UP="false"
 GEN_GITHUB_URL=""
 GEN_GITHUB_STATUS_MESSAGE=""
+GEN_EVENTS="${DOTFRIEND_GENERATE_EVENTS:-false}"
+GEN_EVENT_FD="${DOTFRIEND_GENERATE_EVENT_FD:-1}"
+GEN_FORCE="${DOTFRIEND_GENERATE_FORCE:-false}"
+GEN_NO_PUSH="${DOTFRIEND_GENERATE_NO_PUSH:-false}"
+
+_generate_emit_event() {
+  local event="$1" payload="${2:-}"
+  [[ "$GEN_EVENTS" == "true" ]] || return 0
+  [[ -n "$payload" ]] || payload="{}"
+  api_event "$event" "$payload" >&"$GEN_EVENT_FD"
+}
+
+_generation_state_file() {
+  printf '%s/.dotfriend/generation-state.json' "$GEN_DIR"
+}
+
+_generation_section_fingerprint() {
+  local section="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    {
+      printf '%s\n' "$section"
+      if command -v jq >/dev/null 2>&1 && [[ -f "$SELECTIONS_FILE" ]]; then
+        jq -S -c '.' "$SELECTIONS_FILE" 2>/dev/null || cat "$SELECTIONS_FILE"
+      elif [[ -f "$SELECTIONS_FILE" ]]; then
+        cat "$SELECTIONS_FILE"
+      fi
+    } | shasum -a 256 | awk '{print $1}'
+  else
+    printf '%s:%s\n' "$section" "$(date +%s)"
+  fi
+}
+
+_generation_section_is_current() {
+  local section="$1" fingerprint="$2" state_file
+  state_file="$(_generation_state_file)"
+  [[ -f "$state_file" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e --arg section "$section" --arg fingerprint "$fingerprint" \
+    '.sections[$section].fingerprint == $fingerprint' "$state_file" >/dev/null 2>&1
+}
+
+_generation_mark_section() {
+  local section="$1" fingerprint="$2" state_file tmpfile
+  command -v jq >/dev/null 2>&1 || return 0
+  state_file="$(_generation_state_file)"
+  ensure_dir "$(dirname "$state_file")"
+  tmpfile="$(mktemp)"
+  if [[ -f "$state_file" ]]; then
+    jq --arg section "$section" \
+      --arg fingerprint "$fingerprint" \
+      --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+      '.schema_version = 1
+       | .generated_by = "dotfriend"
+       | .sections[$section] = {fingerprint:$fingerprint, generated_at:$generated_at}' \
+      "$state_file" > "$tmpfile"
+  else
+    jq -n --arg section "$section" \
+      --arg fingerprint "$fingerprint" \
+      --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+      '{schema_version:1,generated_by:"dotfriend",sections:{($section):{fingerprint:$fingerprint,generated_at:$generated_at}}}' \
+      > "$tmpfile"
+  fi
+  mv "$tmpfile" "$state_file"
+}
+
+_generation_run_section() {
+  local section="$1" label="$2"
+  shift 2
+  local fingerprint
+  fingerprint="$(_generation_section_fingerprint "$section")"
+
+  _generate_emit_event "step_started" "$(jq -cn --arg step "$section" --arg label "$label" '{step:$step,label:$label}')"
+  if _generation_section_is_current "$section" "$fingerprint"; then
+    log_info "Skipping ${label}; unchanged."
+    _generate_emit_event "step_finished" "$(jq -cn --arg step "$section" --arg status "skipped" '{step:$step,status:$status}')"
+    return 0
+  fi
+
+  "$@"
+  _generation_mark_section "$section" "$fingerprint"
+  _generate_emit_event "step_finished" "$(jq -cn --arg step "$section" --arg status "ok" '{step:$step,status:$status}')"
+}
 
 # ─────────────────────────────────────────────────────────────
 # JSON reading (jq preferred, naive fallback)
@@ -91,78 +179,19 @@ _copy_tree_filtered() {
   ensure_dir "$dest"
 
   if command -v rsync >/dev/null 2>&1; then
-    local config_excludes=()
-    if [[ "$filter_profile" == "config" ]]; then
-      config_excludes+=(--exclude 'extensions/')
-    fi
-    rsync -a \
-      --exclude '.git/' \
-      --exclude '.gitignore' \
-      --exclude 'node_modules/' \
-      --exclude 'bower_components/' \
-      --exclude 'jspm_packages/' \
-      --exclude '.next/' \
-      --exclude 'dist/' \
-      --exclude 'build/' \
-      --exclude '.build/' \
-      --exclude 'coverage/' \
-      --exclude 'vendor/' \
-      --exclude 'Pods/' \
-      --exclude '.gradle/' \
-      --exclude '__pycache__/' \
-      --exclude '.pytest_cache/' \
-      --exclude '.mypy_cache/' \
-      --exclude '.ruff_cache/' \
-      --exclude '.tox/' \
-      --exclude 'virtenv/' \
-      --exclude 'venv/' \
-      --exclude '.venv/' \
-      --exclude 'virtualenv/' \
-      --exclude 'gcloud/' \
-      --exclude '.gcloud/' \
-      --exclude '.cache/' \
-      --exclude 'cache/' \
-      --exclude 'Cache/' \
-      --exclude 'Caches/' \
-      --exclude '.npm/' \
-      --exclude '.pnpm-store/' \
-      --exclude '.yarn/' \
-      --exclude 'tmp/' \
-      --exclude 'temp/' \
-      --exclude 'logs/' \
-      --exclude 'log/' \
-      --exclude 'marketplace/' \
-      --exclude 'marketplaces/' \
-      --exclude 'plugin-marketplace/' \
-      --exclude 'plugin-marketplaces/' \
-      --exclude 'sessions/' \
-      --exclude 'archived_sessions/' \
-      --exclude 'generated/' \
-      --exclude '.generated/' \
-      --exclude 'generated_images/' \
-      --exclude 'sqlite/' \
-      --exclude '.turbo/' \
-      --exclude '.parcel-cache/' \
-      --exclude '.vite/' \
-      --exclude '.nuxt/' \
-      --exclude '.svelte-kit/' \
-      --exclude '.astro/' \
-      "${config_excludes[@]}" \
-      "$src/" "$dest/"
+    local -a exclude_args=()
+    local pattern
+    while IFS= read -r pattern; do
+      [[ -n "$pattern" ]] || continue
+      exclude_args+=(--exclude "$pattern")
+    done < <(dotfriend_prune_rsync_patterns "$filter_profile")
+
+    rsync -a "${exclude_args[@]}" "$src/" "$dest/"
     return 0
   fi
 
   cp -a "$src/." "$dest/"
-  if [[ "$filter_profile" == "config" ]]; then
-    find "$dest" \
-      \( -name '.git' -o -name 'node_modules' -o -name 'bower_components' -o -name 'jspm_packages' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name '.build' -o -name 'coverage' -o -name 'vendor' -o -name 'Pods' -o -name '.gradle' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name '.tox' -o -name 'virtenv' -o -name 'venv' -o -name '.venv' -o -name 'virtualenv' -o -name 'gcloud' -o -name '.gcloud' -o -name '.cache' -o -name 'cache' -o -name 'Cache' -o -name 'Caches' -o -name '.npm' -o -name '.pnpm-store' -o -name '.yarn' -o -name 'tmp' -o -name 'temp' -o -name 'logs' -o -name 'log' -o -name 'marketplace' -o -name 'marketplaces' -o -name 'plugin-marketplace' -o -name 'plugin-marketplaces' -o -name 'sessions' -o -name 'archived_sessions' -o -name 'generated' -o -name '.generated' -o -name 'generated_images' -o -name 'sqlite' -o -name '.turbo' -o -name '.parcel-cache' -o -name '.vite' -o -name '.nuxt' -o -name '.svelte-kit' -o -name '.astro' -o -name 'extensions' \) \
-      -prune -exec rm -rf {} + 2>/dev/null || true
-  else
-    find "$dest" \
-      \( -name '.git' -o -name 'node_modules' -o -name 'bower_components' -o -name 'jspm_packages' -o -name '.next' -o -name 'dist' -o -name 'build' -o -name '.build' -o -name 'coverage' -o -name 'vendor' -o -name 'Pods' -o -name '.gradle' -o -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.ruff_cache' -o -name '.tox' -o -name 'virtenv' -o -name 'venv' -o -name '.venv' -o -name 'virtualenv' -o -name 'gcloud' -o -name '.gcloud' -o -name '.cache' -o -name 'cache' -o -name 'Cache' -o -name 'Caches' -o -name '.npm' -o -name '.pnpm-store' -o -name '.yarn' -o -name 'tmp' -o -name 'temp' -o -name 'logs' -o -name 'log' -o -name 'marketplace' -o -name 'marketplaces' -o -name 'plugin-marketplace' -o -name 'plugin-marketplaces' -o -name 'sessions' -o -name 'archived_sessions' -o -name 'generated' -o -name '.generated' -o -name 'generated_images' -o -name 'sqlite' -o -name '.turbo' -o -name '.parcel-cache' -o -name '.vite' -o -name '.nuxt' -o -name '.svelte-kit' -o -name '.astro' \) \
-      -prune -exec rm -rf {} + 2>/dev/null || true
-  fi
-  find "$dest" -name '.gitignore' -type f -delete 2>/dev/null || true
+  dotfriend_remove_pruned_paths "$dest" "$filter_profile"
 }
 
 _sanitize_agent_file_copy() {
@@ -350,6 +379,9 @@ _generate_install_sh() {
   _build_dock_block > "$tmpfile"
   _replace_placeholder "$out" "{{DOCK_BLOCK}}" "$tmpfile"
 
+  _build_macos_defaults_block > "$tmpfile"
+  _replace_placeholder "$out" "{{MACOS_DEFAULTS_BLOCK}}" "$tmpfile"
+
   _build_duti_block > "$tmpfile"
   _replace_placeholder "$out" "{{DUTI_BLOCK}}" "$tmpfile"
 
@@ -523,6 +555,47 @@ _generate_restore_manifest() {
   log_ok "Restore manifest generated"
 }
 
+_generate_macos_defaults() {
+  if ! command -v jq >/dev/null 2>&1; then
+    log_warn "jq is required to generate Mac settings"
+    return 0
+  fi
+
+  local selected_count out tmpfile catalog_version
+  selected_count="$(jq -r '(.macos_defaults // []) | length' "$SELECTIONS_FILE" 2>/dev/null || printf '0')"
+  out="${GEN_DIR}/macos/defaults.json"
+
+  if [[ "$selected_count" == "0" ]]; then
+    rm -f "$out"
+    return 0
+  fi
+
+  log_info "Generating Mac settings..."
+  ensure_dir "$(dirname "$out")"
+  tmpfile="$(mktemp)"
+  catalog_version=""
+  if [[ -f "${SCRIPT_DIR}/macos-defaults.json" ]]; then
+    catalog_version="$(jq -r '.catalog_version // ""' "${SCRIPT_DIR}/macos-defaults.json" 2>/dev/null || true)"
+  fi
+
+  jq -n \
+    --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --arg catalog_version "$catalog_version" \
+    --slurpfile selections_file "$SELECTIONS_FILE" \
+    '
+    ($selections_file[0].macos_defaults // []) as $entries |
+    {
+      schema_version: 1,
+      generated_by: "dotfriend",
+      generated_at: $generated_at,
+      catalog_version: $catalog_version,
+      entries: $entries
+    }' > "$tmpfile"
+
+  mv "$tmpfile" "$out"
+  log_ok "Mac settings generated"
+}
+
 _generate_agent_artifacts_manifest() {
   log_info "Generating agent artifact manifest..."
   agent_artifacts_write_for_generated_repo "$GEN_DIR" "$SELECTIONS_FILE" "${SCRIPT_DIR}/agent-tools.json"
@@ -542,6 +615,8 @@ This directory is generated by dotfriend and describes what the repo owns.
 - `agent-artifacts.json` is the agent configuration contract for managed MCPs, instructions, rules, skills, and shared stores.
 - `selections.json` is the captured wizard choice set used to generate this repo.
 - `agent-tools.json` records canonical agent config locations.
+
+When selected Mac settings are present, `../macos/defaults.json` contains the reviewed values that install and sync are allowed to manage.
 
 dotfriend preserves personal config outside managed entries. Managed JSON entries carry `_managed_by: "dotfriend"` and `_dotfriend_artifact_id`. Managed Markdown uses `<!-- dotfriend:start id="..." -->` / `<!-- dotfriend:end id="..." -->` blocks. Whole-file overwrite is only allowed when an item explicitly declares `ownership: "dotfriend_full_file"`.
 
@@ -598,13 +673,15 @@ _generate_readme_md() {
     printf '```bash\n'
     printf './scripts/backup.sh --commit\n'
     printf '```\n\n'
-    printf '%s\n\n' "These sync flows update the generated repo content that dotfriend tracks, including your Brewfile, npm globals, tracked dotfiles/configs, selected agent configs, and VS Code/Cursor extension ID lists."
+    printf '%s\n\n' "These sync flows update the generated repo content that dotfriend tracks, including your Brewfile, npm globals, tracked dotfiles/configs, selected Mac settings, selected agent configs, and VS Code/Cursor extension ID lists."
     printf '%s\n\n' "## What Gets Restored"
     printf '%s\n' '- Homebrew taps, formulae, casks, and Mac App Store apps from `Brewfile`'
     printf '%s\n' '- Global npm packages from `npm-global.txt`'
     printf '%s\n' '- Tracked shell dotfiles and app config directories'
+    printf '%s\n' '- Selected Mac settings from `macos/defaults.json`'
     printf '%s\n' '- Selected agent config files and managed subdirectories'
     printf '%s\n\n' '- VS Code and Cursor extensions from `vscode/extensions.txt` and `cursor/extensions.txt`'
+    printf '%s\n\n' 'Only Mac settings selected during review are included. `install.sh` applies them through `scripts/apply-macos-defaults.sh`; use `DRY_RUN=true ./install.sh` for a preview.'
     printf '%s\n\n' "## dotfriend Metadata"
     printf '%s\n\n' '`.dotfriend/restore-manifest.json` describes every path dotfriend may restore or sync. It uses relative repo paths and approved target paths so backend callers can inspect changes before writes.'
     printf '%s\n\n' '`.dotfriend/agent-artifacts.json` describes managed agent config artifacts such as MCP entries, instructions, skills, rules, and shared stores.'
@@ -792,6 +869,19 @@ _build_dock_block() {
   fi
 }
 
+_build_macos_defaults_block() {
+  local count
+  count="$(_jq_str "$SELECTIONS_FILE" '(.macos_defaults // []) | length')"
+  printf "\n  # Mac settings\n"
+  if [[ "${count:-0}" != "0" ]]; then
+    printf '  if [[ -x "$DOTFILES_DIR/scripts/apply-macos-defaults.sh" && -f "$DOTFILES_DIR/macos/defaults.json" ]]; then\n'
+    printf '    soft_run "$DOTFILES_DIR/scripts/apply-macos-defaults.sh" || true\n'
+    printf '  fi\n'
+  else
+    printf '  # Mac settings skipped by user\n'
+  fi
+}
+
 _build_duti_block() {
   local dock; dock="$(_jq_str "$SELECTIONS_FILE" '.dock')"
   printf "\n  # Default app associations\n"
@@ -884,8 +974,12 @@ _copy_editor_configs() {
       if [[ -f "${vscode_dir}/keybindings.json" ]]; then
         cp "${vscode_dir}/keybindings.json" "${dest}/keybindings.json"
       fi
-      if command -v code >/dev/null 2>&1; then
-        code --list-extensions > "${dest}/extensions.txt" 2>/dev/null || true
+      local vscode_extensions
+      vscode_extensions="$(dotfriend_cached_editor_extensions vscode || true)"
+      if [[ -n "$vscode_extensions" ]]; then
+        printf '%s\n' "$vscode_extensions" | sort -u > "${dest}/extensions.txt"
+      elif command -v code >/dev/null 2>&1; then
+        dotfriend_run_optional_command code --list-extensions | sort -u > "${dest}/extensions.txt" || true
       fi
       log_ok "VS Code settings backed up"
     fi
@@ -902,8 +996,12 @@ _copy_editor_configs() {
       if [[ -f "${cursor_dir}/keybindings.json" ]]; then
         cp "${cursor_dir}/keybindings.json" "${dest}/keybindings.json"
       fi
-      if command -v cursor >/dev/null 2>&1; then
-        cursor --list-extensions > "${dest}/extensions.txt" 2>/dev/null || true
+      local cursor_extensions
+      cursor_extensions="$(dotfriend_cached_editor_extensions cursor || true)"
+      if [[ -n "$cursor_extensions" ]]; then
+        printf '%s\n' "$cursor_extensions" | sort -u > "${dest}/extensions.txt"
+      elif command -v cursor >/dev/null 2>&1; then
+        dotfriend_run_optional_command cursor --list-extensions | sort -u > "${dest}/extensions.txt" || true
       fi
       log_ok "Cursor settings backed up"
     fi
@@ -1055,6 +1153,11 @@ _github_push() {
   GEN_GITHUB_BACKED_UP="false"
   GEN_GITHUB_URL=""
   GEN_GITHUB_STATUS_MESSAGE=""
+  if [[ "$GEN_NO_PUSH" == "true" ]]; then
+    GEN_GITHUB_STATUS_MESSAGE="GitHub backup was skipped because --no-push was set."
+    log_info "--no-push set; skipping GitHub push"
+    return 0
+  fi
   if [[ -z "$repo_name" || "$repo_name" == "null" ]]; then
     GEN_GITHUB_STATUS_MESSAGE="GitHub backup was skipped because no repository name was configured."
     log_info "No GitHub repo configured; skipping push"
@@ -1176,7 +1279,7 @@ generate_repo() {
     return 0
   fi
 
-  if [[ -d "$GEN_DIR" && -n "$(ls -A "$GEN_DIR" 2>/dev/null)" ]]; then
+  if [[ -d "$GEN_DIR" && -n "$(ls -A "$GEN_DIR" 2>/dev/null)" && "$GEN_FORCE" != "true" ]]; then
     if ! gum_confirm "${GEN_DIR} already exists and is not empty. Overwrite?"; then
       log_error "Aborting"
       return 1
@@ -1195,26 +1298,28 @@ generate_repo() {
   ensure_dir "${GEN_DIR}/agents/skills"
   ensure_dir "${GEN_DIR}/agents/agent-docs"
   ensure_dir "${GEN_DIR}/dock"
+  ensure_dir "${GEN_DIR}/macos"
 
   log_step "Generating dotfiles repository"
   log_info "Target directory: ${GEN_DIR}"
 
-  _generate_brewfile
-  _generate_install_sh
-  _generate_bootstrap_sh
-  _generate_gitignore
-  _generate_locations_md
-  _generate_repo_metadata
-  _generate_readme_md
-  _generate_dotfriend_readme_md
+  _generation_run_section "brewfile" "Generating package list" _generate_brewfile
+  _generation_run_section "install_script" "Generating install script" _generate_install_sh
+  _generation_run_section "bootstrap_script" "Generating bootstrap script" _generate_bootstrap_sh
+  _generation_run_section "gitignore" "Generating ignore rules" _generate_gitignore
+  _generation_run_section "locations" "Generating location reference" _generate_locations_md
+  _generation_run_section "repo_metadata" "Generating sync metadata" _generate_repo_metadata
+  _generation_run_section "readme" "Generating README" _generate_readme_md
+  _generation_run_section "dotfriend_readme" "Generating dotfriend metadata README" _generate_dotfriend_readme_md
 
-  _copy_configs
-  _copy_editor_configs
-  _copy_agent_configs
-  _copy_dock
-  _copy_scripts
-  _generate_restore_manifest
-  _generate_agent_artifacts_manifest
+  _generation_run_section "configs" "Copying selected config files" _copy_configs
+  _generation_run_section "editor_configs" "Copying editor settings" _copy_editor_configs
+  _generation_run_section "agent_configs" "Copying agent settings" _copy_agent_configs
+  _generation_run_section "dock" "Copying Dock layout" _copy_dock
+  _generation_run_section "macos_defaults" "Generating Mac settings" _generate_macos_defaults
+  _generation_run_section "scripts" "Copying helper scripts" _copy_scripts
+  _generation_run_section "restore_manifest" "Generating restore manifest" _generate_restore_manifest
+  _generation_run_section "agent_artifacts" "Generating agent artifact manifest" _generate_agent_artifacts_manifest
 
   _init_git
   _github_push

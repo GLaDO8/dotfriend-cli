@@ -429,6 +429,37 @@ run_check_dotfriend_metadata() {
     record "restore target paths" "pass" "all target paths are allowed"
   fi
 
+  if jq -e '.items[]? | select(.type == "macos_defaults")' "$manifest" >/dev/null; then
+    local macos_defaults="${REPO_ROOT}/macos/defaults.json"
+    local apply_script="${REPO_ROOT}/scripts/apply-macos-defaults.sh"
+    if [[ ! -f "$macos_defaults" ]]; then
+      record "Mac settings file" "fail" "macos/defaults.json is missing"
+    elif ! json_ok "$macos_defaults"; then
+      record "Mac settings JSON" "fail" "macos/defaults.json is not valid JSON"
+    elif jq -e '
+      .schema_version == 1
+      and (.entries | type == "array")
+      and all(.entries[]?;
+        (.id | type == "string" and length > 0)
+        and (.domain | type == "string" and length > 0)
+        and (.key | type == "string" and length > 0)
+        and (.scope | IN("user","currentHost"))
+        and (.value_type | IN("bool","int","float","string"))
+        and has("value")
+      )
+    ' "$macos_defaults" >/dev/null; then
+      record "Mac settings schema" "pass" "macos/defaults.json is valid"
+    else
+      record "Mac settings schema" "fail" "macos/defaults.json failed validation"
+    fi
+
+    if [[ -x "$apply_script" ]]; then
+      record "Mac settings apply script" "pass" "apply-macos-defaults.sh is executable"
+    else
+      record "Mac settings apply script" "fail" "apply-macos-defaults.sh is missing or not executable"
+    fi
+  fi
+
   if [[ -f "$artifacts" ]]; then
     if ! json_ok "$artifacts"; then
       record "agent artifacts JSON" "fail" "agent-artifacts.json is not valid JSON"

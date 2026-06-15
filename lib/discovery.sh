@@ -36,7 +36,13 @@ _fetch_cask_api() {
   fi
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "https://formulae.brew.sh/api/cask.json" -o "$_CASK_API_JSON" 2>/dev/null || true
+    local tmpfile
+    tmpfile="$(mktemp)"
+    if dotfriend_run_optional_command curl -fsSL "https://formulae.brew.sh/api/cask.json" > "$tmpfile"; then
+      mv "$tmpfile" "$_CASK_API_JSON"
+    else
+      rm -f "$tmpfile"
+    fi
   fi
 }
 
@@ -235,7 +241,7 @@ _batch_lookup_mas_receipt_apps() {
   apps_input="$(cat)"
   [[ -n "$apps_input" ]] || return 0
 
-  mas_output="$(mas list 2>/dev/null || true)"
+  mas_output="$(dotfriend_run_optional_command mas list || true)"
   [[ -n "$mas_output" ]] || return 0
 
   awk '
@@ -387,14 +393,14 @@ discover_brew_formulae() {
   fi
 
   local formulae
-  formulae="$(brew leaves 2>/dev/null || brew list --formula 2>/dev/null || true)"
+  formulae="$(dotfriend_run_optional_command brew leaves || dotfriend_run_optional_command brew list --formula || true)"
   if [[ -z "$formulae" ]]; then
     return 0
   fi
 
   local output
   # shellcheck disable=SC2086
-  output="$(brew desc $formulae 2>/dev/null | sed 's/: /|/' || true)"
+  output="$(dotfriend_run_optional_command brew desc $formulae | sed 's/: /|/' || true)"
 
   if [[ -n "$output" ]]; then
     printf '%s\n' "$output"
@@ -409,7 +415,7 @@ discover_brew_casks() {
   if ! has_brew; then
     return 0
   fi
-  brew list --cask 2>/dev/null || true
+  dotfriend_run_optional_command brew list --cask || true
 }
 
 # List tapped repositories.
@@ -417,7 +423,7 @@ discover_brew_taps() {
   if ! has_brew; then
     return 0
   fi
-  brew tap 2>/dev/null || true
+  dotfriend_run_optional_command brew tap || true
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -433,7 +439,10 @@ discover_npm_globals() {
 
   # Prefer JSON + Node for robust scoped-package support
   if command -v node >/dev/null 2>&1; then
-    npm list -g --depth=0 --json 2>/dev/null | node -e '
+    local npm_json
+    npm_json="$(dotfriend_run_optional_command npm list -g --depth=0 --json || true)"
+    [[ -n "$npm_json" ]] || return 0
+    printf '%s' "$npm_json" | node -e '
       const data = require("fs").readFileSync(0, "utf8");
       const json = JSON.parse(data);
       const deps = json.dependencies || {};
@@ -443,7 +452,7 @@ discover_npm_globals() {
     ' 2>/dev/null || true
   else
     # Fallback text-tree parsing
-    npm list -g --depth=0 2>/dev/null \
+    dotfriend_run_optional_command npm list -g --depth=0 \
       | grep -oE '(\@[^/]+/)?[^@[:space:]]+@[^[:space:]]+' \
       || true
   fi
@@ -578,7 +587,7 @@ discover_vscode() {
   fi
 
   if command -v code >/dev/null 2>&1; then
-    code --list-extensions 2>/dev/null || true
+    dotfriend_run_optional_command code --list-extensions || true
   fi
 }
 
@@ -592,7 +601,7 @@ discover_cursor() {
   fi
 
   if command -v cursor >/dev/null 2>&1; then
-    cursor --list-extensions 2>/dev/null || true
+    dotfriend_run_optional_command cursor --list-extensions || true
   fi
 }
 
@@ -603,8 +612,172 @@ discover_cursor() {
 # List Dock items if dockutil is installed.
 discover_dock() {
   if command -v dockutil >/dev/null 2>&1; then
-    dockutil --list 2>/dev/null || true
+    dotfriend_run_optional_command dockutil --list || true
   fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Curated macOS defaults discovery
+# ─────────────────────────────────────────────────────────────
+
+macos_defaults_catalog_file() {
+  printf '%s' "${DOTFRIEND_MACOS_DEFAULTS_CATALOG_FILE:-${SCRIPT_DIR}/macos-defaults.json}"
+}
+
+macos_defaults_validate_catalog() {
+  local catalog_file="${1:-$(macos_defaults_catalog_file)}"
+  [[ -f "$catalog_file" ]] || { printf 'macOS defaults catalog missing: %s\n' "$catalog_file" >&2; return 1; }
+  command -v jq >/dev/null 2>&1 || { printf 'jq is required for macOS defaults catalog validation\n' >&2; return 1; }
+
+  jq -e '
+    .schema_version == 1
+    and (.catalog_version | type == "string" and length > 0)
+    and (.entries | type == "array")
+    and all(.entries[]?;
+      (.id | type == "string" and length > 0)
+      and (.category | type == "string" and length > 0)
+      and (.title | type == "string" and length > 0)
+      and (.description | type == "string")
+      and (.domain | type == "string" and length > 0)
+      and (.key | type == "string" and length > 0)
+      and (.scope | IN("user","currentHost"))
+      and (.value_type | IN("bool","int","float","string"))
+      and (.risk | IN("safe","attention","risky"))
+      and (.default_selected | type == "boolean")
+      and ((.restart // []) | type == "array")
+      and ((.source // "") | type == "string" and length > 0)
+    )
+  ' "$catalog_file" >/dev/null
+}
+
+_macos_defaults_expected_read_type() {
+  case "$1" in
+    bool) printf 'boolean' ;;
+    int) printf 'integer' ;;
+    float) printf 'float' ;;
+    string) printf 'string' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+_macos_defaults_read_type_matches() {
+  local value_type="$1" raw_type="$2" expected_type
+  expected_type="$(_macos_defaults_expected_read_type "$value_type")"
+  [[ "$raw_type" == "$expected_type" ]] || [[ "$value_type" == "int" && "$raw_type" == "float" ]]
+}
+
+_macos_defaults_convert_value_json() {
+  local value_type="$1" raw="$2"
+  case "$value_type" in
+    bool)
+      case "$raw" in
+        1|true|TRUE|True|yes|YES|Yes) printf 'true' ;;
+        0|false|FALSE|False|no|NO|No) printf 'false' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    int)
+      jq -cn --arg raw "$raw" '
+        ($raw | tonumber) as $n |
+        if $n == ($n | floor) then ($n | floor) else error("not an integer") end
+      '
+      ;;
+    float)
+      jq -cn --arg raw "$raw" '$raw | tonumber'
+      ;;
+    string)
+      jq -cn --arg raw "$raw" '$raw'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+_macos_defaults_read_command() {
+  local scope="$1"
+  local timeout_seconds="${DOTFRIEND_MACOS_DEFAULTS_COMMAND_TIMEOUT:-1}"
+  shift
+  if [[ "$scope" == "currentHost" ]]; then
+    DOTFRIEND_OPTIONAL_COMMAND_TIMEOUT="$timeout_seconds" dotfriend_run_optional_command defaults -currentHost "$@"
+  else
+    DOTFRIEND_OPTIONAL_COMMAND_TIMEOUT="$timeout_seconds" dotfriend_run_optional_command defaults "$@"
+  fi
+}
+
+macos_defaults_read_value_json() {
+  local domain="$1" key="$2" scope="$3" value_type="$4"
+  local read_type raw_type expected_type raw_value
+
+  read_type="$(_macos_defaults_read_command "$scope" read-type "$domain" "$key" 2>/dev/null)" || return 1
+  [[ -n "$read_type" ]] || return 1
+
+  raw_type="$(printf '%s' "$read_type" | sed 's/^Type is //; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+  if ! _macos_defaults_read_type_matches "$value_type" "$raw_type"; then
+    return 2
+  fi
+
+  raw_value="$(_macos_defaults_read_command "$scope" read "$domain" "$key" 2>/dev/null || true)"
+  [[ -n "$raw_value" ]] || return 1
+  raw_value="$(printf '%s' "$raw_value" | sed 's/[[:space:]]*$//')"
+  _macos_defaults_convert_value_json "$value_type" "$raw_value"
+}
+
+discover_macos_defaults() {
+  local catalog_file="${1:-$(macos_defaults_catalog_file)}"
+  macos_defaults_validate_catalog "$catalog_file"
+
+  local catalog_version items_json found_count missing_count skipped_count risky_count entry_json
+  catalog_version="$(jq -r '.catalog_version' "$catalog_file")"
+  items_json="[]"
+  found_count=0
+  missing_count=0
+  skipped_count=0
+  risky_count=0
+
+  while IFS= read -r entry_json; do
+    [[ -n "$entry_json" ]] || continue
+
+    local id domain key scope value_type value_json status
+    id="$(jq -r '.id' <<< "$entry_json")"
+    domain="$(jq -r '.domain' <<< "$entry_json")"
+    key="$(jq -r '.key' <<< "$entry_json")"
+    scope="$(jq -r '.scope' <<< "$entry_json")"
+    value_type="$(jq -r '.value_type' <<< "$entry_json")"
+    status=0
+    value_json="$(macos_defaults_read_value_json "$domain" "$key" "$scope" "$value_type")" || status=$?
+
+    case "$status" in
+      0)
+        local item_json
+        item_json="$(jq -cn --argjson entry "$entry_json" --argjson value "$value_json" '
+          $entry
+          | .value = $value
+          | .status = "found"
+        ')"
+        items_json="$(jq -cn --argjson items "$items_json" --argjson item "$item_json" '$items + [$item]')"
+        ((found_count++)) || true
+        if [[ "$(jq -r '.risk' <<< "$entry_json")" == "risky" ]]; then
+          ((risky_count++)) || true
+        fi
+        ;;
+      2)
+        ((skipped_count++)) || true
+        ;;
+      *)
+        ((missing_count++)) || true
+        ;;
+    esac
+  done < <(jq -c '.entries[]' "$catalog_file")
+
+  jq -cn \
+    --arg catalog_version "$catalog_version" \
+    --argjson items "$items_json" \
+    --argjson found "$found_count" \
+    --argjson missing "$missing_count" \
+    --argjson skipped "$skipped_count" \
+    --argjson risky "$risky_count" \
+    '{catalog_version:$catalog_version,items:$items,counts:{found:$found,missing:$missing,skipped:$skipped,risky:$risky}}'
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -643,7 +816,7 @@ write_discovery_v2() {
     return 1
   fi
 
-  local apps_json formulae_json casks_json taps_json npm_json agents_json dotfiles_json config_dirs_json vscode_json cursor_json dock_json
+  local apps_json formulae_json casks_json taps_json npm_json agents_json dotfiles_json config_dirs_json vscode_json cursor_json dock_json macos_defaults_json
   apps_json="$(_discovery_file_json_array "$tmpdir/apps.txt" '
     split("\n") | map(select(length > 0)) | map(
       split("|") as $p |
@@ -678,6 +851,11 @@ write_discovery_v2() {
   vscode_json="$(_discovery_editor_json "$tmpdir/vscode.txt")"
   cursor_json="$(_discovery_editor_json "$tmpdir/cursor.txt")"
   dock_json="$(_discovery_file_json_array "$tmpdir/dock.txt" 'split("\n") | map(select(length > 0)) | {apps:.}')"
+  if [[ -f "$tmpdir/macos_defaults.json" ]]; then
+    macos_defaults_json="$(jq -c '.' "$tmpdir/macos_defaults.json")"
+  else
+    macos_defaults_json='{"catalog_version":"","items":[],"counts":{"found":0,"missing":0,"skipped":0,"risky":0}}'
+  fi
 
   jq -n \
     --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
@@ -692,6 +870,7 @@ write_discovery_v2() {
     --argjson vscode "$vscode_json" \
     --argjson cursor "$cursor_json" \
     --argjson dock "$dock_json" \
+    --argjson macos_defaults "$macos_defaults_json" \
     '{
       schema_version: 2,
       generated_at: $generated_at,
@@ -704,7 +883,8 @@ write_discovery_v2() {
       dotfiles: $dotfiles,
       config_dirs: $config_dirs,
       editors: {vscode: $vscode, cursor: $cursor},
-      dock: $dock
+      dock: $dock,
+      macos_defaults: $macos_defaults
     }' > "$cache_file"
 }
 
@@ -754,6 +934,8 @@ run_discovery() {
       p10=\$!
       discover_dock > '$tmpdir/dock.txt' 2>/dev/null &
       p11=\$!
+      discover_macos_defaults > '$tmpdir/macos_defaults.json' 2>/dev/null &
+      p12=\$!
       if ! wait \$p1; then exit_code=1; fi
       if ! wait \$p2; then exit_code=1; fi
       if ! wait \$p3; then exit_code=1; fi
@@ -765,6 +947,7 @@ run_discovery() {
       if ! wait \$p9; then exit_code=1; fi
       if ! wait \$p10; then exit_code=1; fi
       if ! wait \$p11; then exit_code=1; fi
+      if ! wait \$p12; then exit_code=1; fi
       exit \$exit_code
     "
 
@@ -790,7 +973,8 @@ run_discovery() {
       printf '  "config_dirs": "%s",\n' "$(json_escape "$(cat "$tmpdir/config_dirs.txt" 2>/dev/null || true)")"
       printf '  "vscode": "%s",\n' "$(json_escape "$(cat "$tmpdir/vscode.txt" 2>/dev/null || true)")"
       printf '  "cursor": "%s",\n' "$(json_escape "$(cat "$tmpdir/cursor.txt" 2>/dev/null || true)")"
-      printf '  "dock": "%s"\n' "$(json_escape "$(cat "$tmpdir/dock.txt" 2>/dev/null || true)")"
+      printf '  "dock": "%s",\n' "$(json_escape "$(cat "$tmpdir/dock.txt" 2>/dev/null || true)")"
+      printf '  "macos_defaults": "%s"\n' "$(json_escape "$(cat "$tmpdir/macos_defaults.json" 2>/dev/null || true)")"
       printf '}\n'
     } > "$cache_file"
   fi
@@ -845,10 +1029,12 @@ load_discovery_v2() {
   DISCOVERY_VSCODE="$(jq -r '.editors.vscode as $v | "settings:\($v.settings_path // "")", ($v.extensions[]? // empty)' "$cache_file")"
   DISCOVERY_CURSOR="$(jq -r '.editors.cursor as $v | "settings:\($v.settings_path // "")", ($v.extensions[]? // empty)' "$cache_file")"
   DISCOVERY_DOCK="$(jq -r '.dock.apps[]? // empty' "$cache_file")"
+  DISCOVERY_MACOS_DEFAULTS="$(jq -c '.macos_defaults // {catalog_version:"",items:[],counts:{found:0,missing:0,skipped:0,risky:0}}' "$cache_file")"
 
   export DISCOVERY_APPS DISCOVERY_FORMULAE DISCOVERY_CASKS DISCOVERY_TAPS \
     DISCOVERY_NPM_GLOBALS DISCOVERY_AGENTS DISCOVERY_DOTFILES \
-    DISCOVERY_CONFIG_DIRS DISCOVERY_VSCODE DISCOVERY_CURSOR DISCOVERY_DOCK
+    DISCOVERY_CONFIG_DIRS DISCOVERY_VSCODE DISCOVERY_CURSOR DISCOVERY_DOCK \
+    DISCOVERY_MACOS_DEFAULTS
 }
 
 load_discovery_legacy() {
@@ -870,6 +1056,7 @@ load_discovery_legacy() {
     DISCOVERY_VSCODE="$(jq -r '.vscode // empty' "$cache_file")"
     DISCOVERY_CURSOR="$(jq -r '.cursor // empty' "$cache_file")"
     DISCOVERY_DOCK="$(jq -r '.dock // empty' "$cache_file")"
+    DISCOVERY_MACOS_DEFAULTS="$(jq -c '.macos_defaults // empty' "$cache_file")"
   else
     DISCOVERY_APPS="$(json_get_key "$cache_file" apps)"
     DISCOVERY_FORMULAE="$(json_get_key "$cache_file" formulae)"
@@ -882,11 +1069,13 @@ load_discovery_legacy() {
     DISCOVERY_VSCODE="$(json_get_key "$cache_file" vscode)"
     DISCOVERY_CURSOR="$(json_get_key "$cache_file" cursor)"
     DISCOVERY_DOCK="$(json_get_key "$cache_file" dock)"
+    DISCOVERY_MACOS_DEFAULTS="$(json_get_key "$cache_file" macos_defaults)"
   fi
 
   export DISCOVERY_APPS DISCOVERY_FORMULAE DISCOVERY_CASKS DISCOVERY_TAPS \
     DISCOVERY_NPM_GLOBALS DISCOVERY_AGENTS DISCOVERY_DOTFILES \
-    DISCOVERY_CONFIG_DIRS DISCOVERY_VSCODE DISCOVERY_CURSOR DISCOVERY_DOCK
+    DISCOVERY_CONFIG_DIRS DISCOVERY_VSCODE DISCOVERY_CURSOR DISCOVERY_DOCK \
+    DISCOVERY_MACOS_DEFAULTS
 }
 
 discovery_cache_data_json() {

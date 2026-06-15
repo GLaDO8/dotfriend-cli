@@ -478,11 +478,282 @@ EOF
   fi
 }
 
+test_backend_generate_events_and_cached_editor_extensions() {
+  setup_case "backend_generate"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": [],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [".zshrc"],
+  "config_dirs": [],
+  "editors": {"vscode": true, "cursor": true},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "backend-repo", "private": true}
+}
+EOF
+  cat > "${DOTFRIEND_CACHE_DIR}/discovery.json" <<'EOF'
+{
+  "schema_version": 2,
+  "editors": {
+    "vscode": {"settings_path": "", "extensions": ["cached.vscode"]},
+    "cursor": {"settings_path": "", "extensions": ["cached.cursor"]}
+  }
+}
+EOF
+  printf '# zshrc\n' > "${HOME}/.zshrc"
+
+  local bin_dir="${TEST_DIR}/backend_generate/bin"
+  mkdir -p "$bin_dir"
+  cat > "${bin_dir}/code" <<'EOF'
+#!/usr/bin/env bash
+printf 'code CLI should not run when discovery cache has extensions\n' >&2
+exit 44
+EOF
+  cat > "${bin_dir}/cursor" <<'EOF'
+#!/usr/bin/env bash
+printf 'cursor CLI should not run when discovery cache has extensions\n' >&2
+exit 45
+EOF
+  chmod +x "${bin_dir}/code" "${bin_dir}/cursor"
+  PATH="${bin_dir}:${PATH}"
+
+  local repo_dir="${TEST_DIR}/backend_generate/out"
+  local stdout_file="${TEST_DIR}/backend_generate/stdout.jsonl"
+  local stderr_file="${TEST_DIR}/backend_generate/stderr.log"
+  if "${PROJECT_ROOT}/dotfriend" --no-bootstrap generate --events --target "$repo_dir" --no-push --force >"$stdout_file" 2>"$stderr_file"; then
+    ok "backend generate --events command succeeds"
+  else
+    ko "backend generate --events command succeeds" "command failed"
+    cat "$stderr_file"
+    return
+  fi
+
+  if jq -s -e 'map(.event) | index("job_started") and index("step_started") and index("step_finished") and index("job_finished")' "$stdout_file" >/dev/null; then
+    ok "backend generate streams JSON events"
+  else
+    ko "backend generate streams JSON events" "missing expected event names"
+  fi
+
+  if grep -v '^{.*}$' "$stdout_file" >/dev/null; then
+    ko "backend generate event stdout stays JSON-only" "saw non-json stdout"
+  else
+    ok "backend generate event stdout stays JSON-only"
+  fi
+
+  if [[ "$(cat "${repo_dir}/vscode/extensions.txt")" == "cached.vscode" && "$(cat "${repo_dir}/cursor/extensions.txt")" == "cached.cursor" ]]; then
+    ok "generation uses cached editor extensions before editor CLIs"
+  else
+    ko "generation uses cached editor extensions before editor CLIs" "cached extension manifests missing"
+  fi
+
+  if [[ -f "${repo_dir}/.dotfriend/generation-state.json" ]]; then
+    ok "generation state is written"
+  else
+    ko "generation state is written" "missing .dotfriend/generation-state.json"
+  fi
+}
+
+test_generation_state_skips_unchanged_sections() {
+  setup_case "generation_state"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": [],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "state-repo", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/generation_state/out"
+  GEN_NO_PUSH=true
+  generate_repo "$repo_dir" false >/dev/null 2>&1
+  printf 'local note\n' > "${repo_dir}/README.md"
+  GEN_FORCE=true
+  generate_repo "$repo_dir" false >/dev/null 2>&1
+  GEN_FORCE=false
+  GEN_NO_PUSH=false
+
+  if [[ "$(cat "${repo_dir}/README.md")" == "local note" ]]; then
+    ok "unchanged generation sections are skipped"
+  else
+    ko "unchanged generation sections are skipped" "README.md was rewritten despite unchanged section fingerprint"
+  fi
+}
+
+test_macos_defaults_generation_and_apply_script() {
+  setup_case "macos_defaults"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": [],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "macos_defaults": [
+    {
+      "id": "dock.orientation",
+      "domain": "com.apple.dock",
+      "key": "orientation",
+      "scope": "user",
+      "value_type": "string",
+      "value": "left",
+      "risk": "safe",
+      "restart": ["Dock"]
+    },
+    {
+      "id": "dock.tile-size",
+      "domain": "com.apple.dock",
+      "key": "tilesize",
+      "scope": "user",
+      "value_type": "int",
+      "value": 42,
+      "risk": "safe",
+      "restart": ["Dock"]
+    },
+    {
+      "id": "safari.auto-open-safe-downloads",
+      "domain": "com.apple.Safari",
+      "key": "AutoOpenSafeDownloads",
+      "scope": "user",
+      "value_type": "bool",
+      "value": true,
+      "risk": "risky",
+      "restart": ["Safari"]
+    },
+    {
+      "id": "trackpad.scale",
+      "domain": "com.apple.trackpad.test",
+      "key": "Scale",
+      "scope": "currentHost",
+      "value_type": "float",
+      "value": 1.25,
+      "risk": "safe",
+      "restart": []
+    }
+  ],
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "macos-defaults-repo", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/macos_defaults/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "selected Mac settings generate repo contents"
+  else
+    GEN_NO_PUSH=false
+    ko "selected Mac settings generate repo contents" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  if jq -e '.entries[] | select(.id == "dock.orientation" and .value == "left")' "${repo_dir}/macos/defaults.json" >/dev/null; then
+    ok "macos/defaults.json records selected reviewed values"
+  else
+    ko "macos/defaults.json records selected reviewed values" "missing dock.orientation"
+  fi
+
+  if [[ -x "${repo_dir}/scripts/apply-macos-defaults.sh" ]]; then
+    ok "Mac settings apply script is generated"
+  else
+    ko "Mac settings apply script is generated" "missing executable script"
+  fi
+
+  if grep -q 'apply-macos-defaults.sh' "${repo_dir}/install.sh"; then
+    ok "install.sh calls Mac settings apply script"
+  else
+    ko "install.sh calls Mac settings apply script" "missing apply script call"
+  fi
+
+  if jq -e '.items[] | select(.id == "macos_defaults:selected" and .type == "macos_defaults" and .restore_mode == "defaults_import")' "${repo_dir}/.dotfriend/restore-manifest.json" >/dev/null; then
+    ok "restore manifest includes Mac settings defaults_import item"
+  else
+    ko "restore manifest includes Mac settings defaults_import item" "missing manifest item"
+  fi
+
+  if bash -n "${repo_dir}/scripts/apply-macos-defaults.sh" && bash -n "${repo_dir}/install.sh"; then
+    ok "generated Mac settings scripts are syntactically valid"
+  else
+    ko "generated Mac settings scripts are syntactically valid" "bash -n failed"
+  fi
+
+  local bin_dir="${TEST_DIR}/macos_defaults/bin"
+  local defaults_log="${TEST_DIR}/macos_defaults/defaults.log"
+  local killall_log="${TEST_DIR}/macos_defaults/killall.log"
+  mkdir -p "$bin_dir"
+  cat > "${bin_dir}/defaults" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${DEFAULTS_LOG:?}"
+if [[ "${1:-}" == "-currentHost" && "${2:-}" == "export" ]]; then
+  mkdir -p "$(dirname "${4:?}")"
+  printf 'plist\n' > "${4:?}"
+elif [[ "${1:-}" == "export" ]]; then
+  mkdir -p "$(dirname "${3:?}")"
+  printf 'plist\n' > "${3:?}"
+fi
+EOF
+  cat > "${bin_dir}/killall" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${KILLALL_LOG:?}"
+EOF
+  chmod +x "${bin_dir}/defaults" "${bin_dir}/killall"
+
+  DEFAULTS_LOG="$defaults_log" KILLALL_LOG="$killall_log" BACKUP_ROOT="${TEST_DIR}/macos_defaults/backup" PATH="${bin_dir}:${PATH}" "${repo_dir}/scripts/apply-macos-defaults.sh" >/dev/null
+
+  if grep -Fqx -- 'write com.apple.dock orientation -string left' "$defaults_log" \
+    && grep -Fqx -- 'write com.apple.dock tilesize -int 42' "$defaults_log" \
+    && grep -Fqx -- 'write com.apple.Safari AutoOpenSafeDownloads -bool true' "$defaults_log" \
+    && grep -Fqx -- '-currentHost write com.apple.trackpad.test Scale -float 1.25' "$defaults_log"; then
+    ok "apply script writes selected Mac settings with typed defaults commands"
+  else
+    ko "apply script writes selected Mac settings with typed defaults commands" "unexpected defaults log"
+  fi
+
+  if [[ "$(grep -c '^Dock$' "$killall_log")" == "1" && "$(grep -c '^Safari$' "$killall_log")" == "1" ]]; then
+    ok "apply script batches process restarts"
+  else
+    ko "apply script batches process restarts" "restart targets were not batched"
+  fi
+
+  if find "${TEST_DIR}/macos_defaults/backup/macos-defaults" -name 'com.apple.dock.plist' -print -quit | grep -q .; then
+    ok "apply script backs up affected defaults domains"
+  else
+    ko "apply script backs up affected defaults domains" "missing domain backup"
+  fi
+}
+
 printf '\n1. Generation regressions\n'
 test_repo_name_and_github_push
 test_agent_and_shared_config_copy
 test_filtered_recursive_copy_and_layout
 test_cursor_extension_manifest_and_metadata
+test_backend_generate_events_and_cached_editor_extensions
+test_generation_state_skips_unchanged_sections
+test_macos_defaults_generation_and_apply_script
 
 printf '\n========================================\n'
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"

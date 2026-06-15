@@ -161,6 +161,60 @@ is_apple_silicon() {
   [[ "$(uname -m)" == "arm64" ]]
 }
 
+# Run an optional discovery/sync command with a short timeout. These commands
+# improve fidelity when available, but must not block app-managed sync paths.
+dotfriend_run_optional_command() {
+  local timeout_seconds="${DOTFRIEND_OPTIONAL_COMMAND_TIMEOUT:-5}"
+  if [[ ! "$timeout_seconds" =~ ^[0-9]+$ || "$timeout_seconds" -lt 1 ]]; then
+    timeout_seconds=5
+  fi
+
+  local stdout_file stderr_file
+  stdout_file="$(mktemp)"
+  stderr_file="$(mktemp)"
+
+  "$@" >"$stdout_file" 2>"$stderr_file" &
+  local command_pid=$!
+
+  (
+    remaining_ticks=$((timeout_seconds * 10))
+    while [[ "$remaining_ticks" -gt 0 ]]; do
+      sleep 0.1
+      if ! kill -0 "$command_pid" >/dev/null 2>&1; then
+        exit 0
+      fi
+      ((remaining_ticks--)) || true
+    done
+    kill "$command_pid" >/dev/null 2>&1 || true
+  ) &
+  local watchdog_pid=$!
+
+  local status=0
+  if wait "$command_pid"; then
+    status=0
+  else
+    status=$?
+  fi
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" >/dev/null 2>&1 || true
+
+  if [[ "$status" -eq 0 ]]; then
+    cat "$stdout_file"
+  fi
+
+  rm -f "$stdout_file" "$stderr_file"
+  return "$status"
+}
+
+dotfriend_cached_editor_extensions() {
+  local editor_id="$1"
+  local cache_file="${DOTFRIEND_CACHE_DIR}/discovery.json"
+  [[ -f "$cache_file" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  jq -r --arg editor_id "$editor_id" '.editors[$editor_id].extensions[]? // empty' "$cache_file" 2>/dev/null || true
+}
+
 # ─────────────────────────────────────────────────────────────
 # Prompt helpers (plain bash fallbacks when gum is missing)
 # ─────────────────────────────────────────────────────────────
