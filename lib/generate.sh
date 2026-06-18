@@ -56,16 +56,29 @@ _generation_state_file() {
   printf '%s/.dotfriend/generation-state.json' "$GEN_DIR"
 }
 
+_generation_fingerprint_input_files() {
+  printf '%s\n' "${SCRIPT_DIR}/generate.sh"
+  if [[ -d "$TEMPLATES_DIR" ]]; then
+    find "$TEMPLATES_DIR" -type f ! -name '*.bak' -print | sort
+  fi
+}
+
 _generation_section_fingerprint() {
   local section="$1"
   if command -v shasum >/dev/null 2>&1; then
     {
+      printf '%s\n' "fingerprint_version=2"
       printf '%s\n' "$section"
       if command -v jq >/dev/null 2>&1 && [[ -f "$SELECTIONS_FILE" ]]; then
         jq -S -c '.' "$SELECTIONS_FILE" 2>/dev/null || cat "$SELECTIONS_FILE"
       elif [[ -f "$SELECTIONS_FILE" ]]; then
         cat "$SELECTIONS_FILE"
       fi
+      while IFS= read -r input_file; do
+        [[ -f "$input_file" ]] || continue
+        printf '%s\n' "input:${input_file}"
+        shasum -a 256 "$input_file"
+      done < <(_generation_fingerprint_input_files)
     } | shasum -a 256 | awk '{print $1}'
   else
     printf '%s:%s\n' "$section" "$(date +%s)"
@@ -345,11 +358,11 @@ _generate_install_sh() {
   # Substitute basic placeholders
   local repo_name; repo_name="$(_selected_repo_name)"
   sed -i.bak "s|{{BACKUP_ROOT:-\${HOME}/.dotfiles-backup}}|${GEN_BACKUP_ROOT}|g" "$out"
-  sed -i.bak "s|{{INSTALL_MAS:-true}}|true|g" "$out"
-  sed -i.bak "s|{{BREW_UPGRADE:-true}}|true|g" "$out"
-  sed -i.bak "s|{{INSTALL_DOTFRIEND:-true}}|true|g" "$out"
-  sed -i.bak "s|{{INSTALL_VALIDATE:-false}}|false|g" "$out"
-  sed -i.bak "s|{{DRY_RUN:-false}}|false|g" "$out"
+  sed -i.bak 's|{{INSTALL_MAS:-true}}|${INSTALL_MAS:-true}|g' "$out"
+  sed -i.bak 's|{{BREW_UPGRADE:-true}}|${BREW_UPGRADE:-true}|g' "$out"
+  sed -i.bak 's|{{INSTALL_DOTFRIEND:-true}}|${INSTALL_DOTFRIEND:-true}|g' "$out"
+  sed -i.bak 's|{{INSTALL_VALIDATE:-false}}|${INSTALL_VALIDATE:-false}|g' "$out"
+  sed -i.bak 's|{{DRY_RUN:-false}}|${DRY_RUN:-false}|g' "$out"
   rm -f "${out}.bak"
 
   # Build blocks into temp files and replace placeholders inline
@@ -803,7 +816,8 @@ _build_npm_block() {
   local npm; npm="$(_jq_str "$SELECTIONS_FILE" '.npm_globals | if . then join("\n") else "" end')"
   printf "\n  # npm global packages\n"
   if [[ -n "$npm" ]]; then
-    printf "  if command -v npm >/dev/null 2>&1; then\n"
+    printf '  ensure_brew_package npm node "npm global packages"\n'
+    printf '  if [[ "$DRY_RUN" == "true" || "$(command -v npm || true)" != "" ]]; then\n'
     while IFS= read -r pkg; do
       [[ -z "$pkg" ]] && continue
       local pkg_name; pkg_name="${pkg%%@*}"
@@ -853,17 +867,22 @@ _build_dock_block() {
   if [[ -n "$dock" ]] && command -v jq >/dev/null 2>&1; then
     local backup; backup="$(jq -r '.backup // false' <<< "$dock" 2>/dev/null || true)"
     if [[ "$backup" == "true" ]]; then
-      printf '  if command -v dockutil >/dev/null 2>&1 && [[ -f "$DOTFILES_DIR/dock/dock-apps.txt" ]]; then\n'
-      printf "    log_info \"Restoring Dock layout...\"\n"
-      printf "    # Clear existing dock\n"
-      printf "    dockutil --remove all --no-restart 2>/dev/null || true\n"
-      printf "    while IFS= read -r app; do\n"
-      printf '      [[ -z "$app" ]] && continue\n'
-      printf '      soft_run dockutil --add "$app" --no-restart || true\n'
-      printf '    done < "$DOTFILES_DIR/dock/dock-apps.txt"\n'
-      printf "    killall Dock 2>/dev/null || true\n"
+      printf '  if [[ -f "$DOTFILES_DIR/dock/dock-apps.txt" ]]; then\n'
+      printf '    ensure_brew_package dockutil dockutil "Dock restore"\n'
+      printf '    if [[ "$DRY_RUN" == "true" || "$(command -v dockutil || true)" != "" ]]; then\n'
+      printf "      log_info \"Restoring Dock layout...\"\n"
+      printf "      # Clear existing dock\n"
+      printf "      soft_run dockutil --remove all --no-restart || true\n"
+      printf "      while IFS= read -r app; do\n"
+      printf '        [[ -z "$app" ]] && continue\n'
+      printf '        soft_run dockutil --add "$app" --no-restart || true\n'
+      printf '      done < "$DOTFILES_DIR/dock/dock-apps.txt"\n'
+      printf "      killall Dock 2>/dev/null || true\n"
+      printf "    else\n"
+      printf "      log_warn \"dockutil not available; skipping dock restore\"\n"
+      printf "    fi\n"
       printf "  else\n"
-      printf "    log_warn \"dockutil not available; skipping dock restore\"\n"
+      printf "    log_info \"No Dock layout found; skipping Dock restore\"\n"
       printf "  fi\n"
     fi
   fi

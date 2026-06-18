@@ -63,7 +63,9 @@ backup_file() {
 }
 
 brew_prefix() {
-  if [[ -d /opt/homebrew/bin ]]; then
+  if [[ -n "${DOTFRIEND_BREW_PREFIX:-}" ]]; then
+    printf '%s' "$DOTFRIEND_BREW_PREFIX"
+  elif [[ -d /opt/homebrew/bin ]]; then
     printf '%s' '/opt/homebrew'
   elif [[ -d /usr/local/bin ]]; then
     printf '%s' '/usr/local'
@@ -78,6 +80,24 @@ json_escape() {
   value="${value//\"/\\\"}"
   value="${value//$'\n'/\\n}"
   printf '%s' "$value"
+}
+
+ensure_brew_package() {
+  local command_name="$1"
+  local package_name="$2"
+  local reason="$3"
+
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_info "[dry-run] Would install ${package_name} for ${reason}"
+    return 0
+  fi
+
+  log_info "Installing ${package_name} for ${reason}..."
+  soft_run brew install "$package_name" || true
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -152,12 +172,9 @@ phase_dotfriend() {
     return 0
   fi
 
-  if ! command -v npm >/dev/null 2>&1; then
-    log_info "npm not found; installing Node.js so dotfriend can be installed"
-    soft_run brew install node || true
-  fi
+  ensure_brew_package npm node "dotfriend CLI"
 
-  if command -v npm >/dev/null 2>&1; then
+  if [[ "$DRY_RUN" == "true" || "$(command -v npm || true)" != "" ]]; then
     soft_run npm install -g dotfriend || true
   else
     log_warn "npm still not found; dotfriend CLI was not installed"
@@ -197,72 +214,11 @@ record_dotfriend_repo() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# Phase 2: Configuration (symlinks, copies, rsyncs)
-# ─────────────────────────────────────────────────────────────
-
-phase_configuration() {
-  log_step "Phase 2: Configuration"
-
-  ensure_dir "$BACKUP_ROOT"
-
-  # Symlinks
-  {{SYMLINKS_BLOCK}}
-
-  # Copies (app-managed files)
-  {{COPIES_BLOCK}}
-
-  # Agent configs (rsync --delete)
-  {{AGENT_RSYNC_BLOCK}}
-}
-
-_symlink() {
-  local src="$1" dest="$2"
-  if [[ "$DRY_RUN" == "true" ]]; then
-    printf "  [dry-run] would symlink %s → %s\\n" "$dest" "$src"
-    return 0
-  fi
-  if [[ -L "$dest" && "$(readlink "$dest")" == "$src" ]]; then
-    log_ok "Already linked: $dest"
-    return 0
-  fi
-  if [[ -e "$dest" || -L "$dest" ]]; then
-    backup_file "$dest" || true
-    rm -rf "$dest" || { log_error "Failed to remove $dest"; return 1; }
-  fi
-  ln -s "$src" "$dest" || { log_error "Failed to symlink $dest"; return 1; }
-  log_ok "Linked $dest → $src"
-}
-
-_copy() {
-  local src="$1" dest="$2"
-  if [[ "$DRY_RUN" == "true" ]]; then
-    printf "  [dry-run] would copy %s → %s\\n" "$src" "$dest"
-    return 0
-  fi
-  if [[ -e "$dest" ]]; then
-    backup_file "$dest"
-  fi
-  cp -a "$src" "$dest" || { log_error "Failed to copy $src to $dest"; return 1; }
-  log_ok "Copied $src → $dest"
-}
-
-_rsync_agent() {
-  local src="$1" dest="$2"
-  if [[ "$DRY_RUN" == "true" ]]; then
-    printf "  [dry-run] would rsync --delete %s/ → %s/\\n" "$src" "$dest"
-    return 0
-  fi
-  ensure_dir "$dest"
-  rsync -a --delete "${src}/" "${dest}/" || { log_error "Failed to rsync $src to $dest"; return 1; }
-  log_ok "Rsynced $src → $dest"
-}
-
-# ─────────────────────────────────────────────────────────────
-# Phase 3: App Setup (Brewfile, npm, extensions)
+# Phase 2: App Setup (Brewfile, npm, extensions)
 # ─────────────────────────────────────────────────────────────
 
 phase_apps() {
-  log_step "Phase 3: App Setup"
+  log_step "Phase 2: App Setup"
 
   # Brewfile
   local brewfile="${DOTFILES_DIR}/Brewfile"
@@ -306,6 +262,68 @@ phase_apps() {
 
   # Cursor extensions
   {{CURSOR_BLOCK}}
+}
+
+# ─────────────────────────────────────────────────────────────
+# Phase 3: Configuration (symlinks, copies, rsyncs)
+# ─────────────────────────────────────────────────────────────
+
+phase_configuration() {
+  log_step "Phase 3: Configuration"
+
+  ensure_dir "$BACKUP_ROOT"
+
+  # Symlinks
+  {{SYMLINKS_BLOCK}}
+
+  # Copies (app-managed files)
+  {{COPIES_BLOCK}}
+
+  # Agent configs (rsync --delete)
+  {{AGENT_RSYNC_BLOCK}}
+}
+
+_symlink() {
+  local src="$1" dest="$2"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    printf "  [dry-run] would symlink %s → %s\\n" "$dest" "$src"
+    return 0
+  fi
+  if [[ -L "$dest" && "$(readlink "$dest")" == "$src" ]]; then
+    log_ok "Already linked: $dest"
+    return 0
+  fi
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    backup_file "$dest" || true
+    rm -rf "$dest" || { log_error "Failed to remove $dest"; return 1; }
+  fi
+  ln -s "$src" "$dest" || { log_error "Failed to symlink $dest"; return 1; }
+  log_ok "Linked $dest → $src"
+}
+
+_copy() {
+  local src="$1" dest="$2"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    printf "  [dry-run] would copy %s → %s\\n" "$src" "$dest"
+    return 0
+  fi
+  if [[ -e "$dest" ]]; then
+    backup_file "$dest"
+  fi
+  ensure_dir "$(dirname "$dest")"
+  cp -a "$src" "$dest" || { log_error "Failed to copy $src to $dest"; return 1; }
+  log_ok "Copied $src → $dest"
+}
+
+_rsync_agent() {
+  local src="$1" dest="$2"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    printf "  [dry-run] would rsync --delete %s/ → %s/\\n" "$src" "$dest"
+    return 0
+  fi
+  ensure_dir "$dest"
+  rsync -a --delete "${src}/" "${dest}/" || { log_error "Failed to rsync $src to $dest"; return 1; }
+  log_ok "Rsynced $src → $dest"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -394,8 +412,8 @@ main() {
   start_sudo_keepalive
   phase_prerequisites
   phase_dotfriend
-  phase_configuration
   phase_apps
+  phase_configuration
   phase_final
   phase_validation
   print_summary

@@ -205,6 +205,14 @@ EOF
     ko "install.sh uses its clone as the managed repo" "DOTFILES_DIR does not default to script directory"
   fi
 
+  if grep -Fq 'DRY_RUN="${DRY_RUN:-false}"' "${repo_dir}/install.sh" \
+    && grep -Fq 'INSTALL_VALIDATE="${INSTALL_VALIDATE:-false}"' "${repo_dir}/install.sh" \
+    && grep -Fq 'INSTALL_DOTFRIEND="${INSTALL_DOTFRIEND:-true}"' "${repo_dir}/install.sh"; then
+    ok "install.sh keeps restore toggles runtime-configurable"
+  else
+    ko "install.sh keeps restore toggles runtime-configurable" "restore toggles were hard-coded during generation"
+  fi
+
   if grep -q 'npm install -g dotfriend' "${repo_dir}/install.sh" && grep -q 'last-sync.json' "${repo_dir}/install.sh"; then
     ok "install.sh installs dotfriend and records sync repo"
   else
@@ -595,6 +603,63 @@ EOF
   fi
 }
 
+test_generator_code_changes_invalidate_generated_install_script() {
+  setup_case "generator_code_change"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": [],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "state-repo", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/generator_code_change/out"
+  local old_fingerprint
+  old_fingerprint="$(
+    {
+      printf '%s\n' "install_script"
+      jq -S -c '.' "${DOTFRIEND_CACHE_DIR}/selections.json"
+    } | shasum -a 256 | awk '{print $1}'
+  )"
+  mkdir -p "${repo_dir}/.dotfriend"
+  printf '# stale install script\n' > "${repo_dir}/install.sh"
+  cat > "${repo_dir}/.dotfriend/generation-state.json" <<EOF
+{
+  "schema_version": 1,
+  "generated_by": "dotfriend",
+  "sections": {
+    "install_script": {
+      "fingerprint": "${old_fingerprint}",
+      "generated_at": "2026-06-01T00:00:00Z"
+    }
+  }
+}
+EOF
+
+  GEN_NO_PUSH=true
+  GEN_FORCE=true
+  generate_repo "$repo_dir" false >/dev/null 2>&1
+  GEN_FORCE=false
+  GEN_NO_PUSH=false
+
+  if grep -Fq 'ensure_brew_package npm node "dotfriend CLI"' "${repo_dir}/install.sh"; then
+    ok "generator changes invalidate stale install.sh"
+  else
+    ko "generator changes invalidate stale install.sh" "install.sh was skipped using an old selection-only fingerprint"
+  fi
+}
+
 test_macos_defaults_generation_and_apply_script() {
   setup_case "macos_defaults"
   cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
@@ -746,6 +811,130 @@ EOF
   fi
 }
 
+test_install_dry_run_plans_restore_dependencies_without_missing_tool_warnings() {
+  setup_case "install_dry_run_dependencies"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": [],
+  "taps": [],
+  "npm_globals": ["typescript@latest"],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": true, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "dry-run-deps", "private": true}
+}
+EOF
+
+  local generate_bin_dir="${TEST_DIR}/install_dry_run_dependencies/generate-bin"
+  mkdir -p "$generate_bin_dir"
+  cat > "${generate_bin_dir}/dockutil" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--list" ]]; then
+  printf '/Applications/Safari.app\tpersistent-apps\tfile:///Applications/Safari.app/\n'
+fi
+EOF
+  chmod +x "${generate_bin_dir}/dockutil"
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/install_dry_run_dependencies/out"
+  GEN_NO_PUSH=true
+  if PATH="${generate_bin_dir}:${PATH}" generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "restore dependency test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "restore dependency test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local dry_home="${TEST_DIR}/install_dry_run_dependencies/new-home"
+  local stdout_file="${TEST_DIR}/install_dry_run_dependencies/install.stdout"
+  local stderr_file="${TEST_DIR}/install_dry_run_dependencies/install.stderr"
+  mkdir -p "$dry_home"
+
+  if HOME="$dry_home" DOTFRIEND_BREW_PREFIX="${TEST_DIR}/install_dry_run_dependencies/missing-brew" PATH="/usr/bin:/bin:/usr/sbin:/sbin" DRY_RUN=true INSTALL_DOTFRIEND=true BREW_UPGRADE=false "$repo_dir/install.sh" >"$stdout_file" 2>"$stderr_file"; then
+    ok "generated install.sh dry-run succeeds without restore dependencies installed"
+  else
+    ko "generated install.sh dry-run succeeds without restore dependencies installed" "install.sh --dry-run failed"
+  fi
+
+  if grep -Fq '[dry-run] Would install node for dotfriend CLI' "$stdout_file" \
+    && grep -Fq '[dry-run] Would install node for npm global packages' "$stdout_file" \
+    && grep -Fq '[dry-run] Would install dockutil for Dock restore' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: npm install -g dotfriend' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: npm install -g typescript' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: dockutil --add /Applications/Safari.app' "$stdout_file"; then
+    ok "install.sh dry-run plans npm and dock restore dependencies"
+  else
+    ko "install.sh dry-run plans npm and dock restore dependencies" "missing planned dependency install"
+  fi
+
+  if grep -Fq 'npm still not found; dotfriend CLI was not installed' "$stderr_file" \
+    || grep -Fq 'npm not found; skipping npm global installs' "$stderr_file" \
+    || grep -Fq 'dockutil not available; skipping dock restore' "$stderr_file"; then
+    ko "install.sh dry-run avoids missing npm and dockutil warnings" "unexpected warning emitted"
+  else
+    ok "install.sh dry-run avoids missing npm and dockutil warnings"
+  fi
+}
+
+test_install_runs_app_setup_before_config_restore() {
+  setup_case "install_order"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": ["aichat"],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": ["aichat"],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "install-order", "private": true}
+}
+EOF
+  mkdir -p "${HOME}/.config/aichat"
+  printf 'model: test\n' > "${HOME}/.config/aichat/config.yaml"
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/install_order/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "install order test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "install order test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local apps_line config_line
+  apps_line="$(grep -n '^  phase_apps$' "${repo_dir}/install.sh" | head -n1 | cut -d: -f1)"
+  config_line="$(grep -n '^  phase_configuration$' "${repo_dir}/install.sh" | head -n1 | cut -d: -f1)"
+  if [[ -n "$apps_line" && -n "$config_line" && "$apps_line" -lt "$config_line" ]]; then
+    ok "install.sh runs app setup before config restore"
+  else
+    ko "install.sh runs app setup before config restore" "phase_configuration still runs before phase_apps"
+  fi
+
+  if grep -Fq '  ensure_dir "$(dirname "$dest")"' "${repo_dir}/install.sh"; then
+    ok "configuration copy creates missing parent directories"
+  else
+    ko "configuration copy creates missing parent directories" "_copy does not create destination parent"
+  fi
+}
+
 printf '\n1. Generation regressions\n'
 test_repo_name_and_github_push
 test_agent_and_shared_config_copy
@@ -753,7 +942,10 @@ test_filtered_recursive_copy_and_layout
 test_cursor_extension_manifest_and_metadata
 test_backend_generate_events_and_cached_editor_extensions
 test_generation_state_skips_unchanged_sections
+test_generator_code_changes_invalidate_generated_install_script
 test_macos_defaults_generation_and_apply_script
+test_install_dry_run_plans_restore_dependencies_without_missing_tool_warnings
+test_install_runs_app_setup_before_config_restore
 
 printf '\n========================================\n'
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"
