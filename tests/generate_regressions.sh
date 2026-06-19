@@ -869,7 +869,7 @@ EOF
     && grep -Fq '[dry-run] Would install node for npm global packages' "$stdout_file" \
     && grep -Fq '[dry-run] Would install dockutil for Dock restore' "$stdout_file" \
     && grep -Fq '[dry-run] would run: npm install -g dotfriend' "$stdout_file" \
-    && grep -Fq '[dry-run] would run: npm install -g typescript' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: npm install -g typescript@latest' "$stdout_file" \
     && grep -Fq '[dry-run] would run: dockutil --add /Applications/Safari.app' "$stdout_file"; then
     ok "install.sh dry-run plans npm and dock restore dependencies"
   else
@@ -882,6 +882,660 @@ EOF
     ko "install.sh dry-run avoids missing npm and dockutil warnings" "unexpected warning emitted"
   else
     ok "install.sh dry-run avoids missing npm and dockutil warnings"
+  fi
+}
+
+test_brewfile_entries_use_real_newlines() {
+  setup_case "brewfile_newlines"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [
+    "Spotify|cask:spotify|cask",
+    "Auto Export|mas:Auto Export,id:1115567069|mas"
+  ],
+  "agents": [],
+  "formulae": ["git", "jq"],
+  "taps": ["alpha/tap", "beta/tap"],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "brewfile-newlines", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/brewfile_newlines/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "brewfile newline test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "brewfile newline test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local brewfile="${repo_dir}/Brewfile"
+  if grep -Fq '\n' "$brewfile"; then
+    ko "Brewfile uses real newlines" "found literal backslash-n text"
+  else
+    ok "Brewfile uses real newlines"
+  fi
+
+  if grep -Fxq 'tap "alpha/tap"' "$brewfile" \
+    && grep -Fxq 'tap "beta/tap"' "$brewfile" \
+    && grep -Fxq 'brew "git"' "$brewfile" \
+    && grep -Fxq 'brew "jq"' "$brewfile" \
+    && grep -Fxq 'cask "spotify"' "$brewfile" \
+    && grep -Fxq 'mas "Auto Export", id: 1115567069' "$brewfile"; then
+    ok "Brewfile package entries are one per line"
+  else
+    ko "Brewfile package entries are one per line" "missing expected line-delimited entries"
+  fi
+}
+
+test_install_times_out_slow_brew_taps_and_continues() {
+  setup_case "install_brew_tap_timeout"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": ["git"],
+  "taps": ["jordandtap/stuck"],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "brew-tap-timeout", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/install_brew_tap_timeout/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "brew tap timeout test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "brew tap timeout test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local fake_prefix="${TEST_DIR}/install_brew_tap_timeout/homebrew"
+  local fake_bin="${TEST_DIR}/install_brew_tap_timeout/bin"
+  local dry_home="${TEST_DIR}/install_brew_tap_timeout/new-home"
+  local brew_log="${TEST_DIR}/install_brew_tap_timeout/brew.log"
+  local stdout_file="${TEST_DIR}/install_brew_tap_timeout/install.stdout"
+  local stderr_file="${TEST_DIR}/install_brew_tap_timeout/install.stderr"
+  mkdir -p "${fake_prefix}/bin" "$fake_bin" "$dry_home"
+
+  cat > "${fake_prefix}/bin/brew" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${BREW_LOG:?}"
+case "${1:-}" in
+  shellenv)
+    exit 0
+    ;;
+  tap)
+    sleep 5
+    exit 0
+    ;;
+  install)
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "${fake_prefix}/bin/brew"
+
+  cat > "${fake_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${fake_bin}/sudo"
+
+  local started_at finished_at elapsed
+  started_at="$(date +%s)"
+  if HOME="$dry_home" BREW_LOG="$brew_log" DOTFRIEND_BREW_PREFIX="$fake_prefix" PATH="${fake_bin}:${fake_prefix}/bin:/usr/bin:/bin:/usr/sbin:/sbin" BREW_UPGRADE=false INSTALL_DOTFRIEND=false BREW_TAP_TIMEOUT_SECONDS=1 "$repo_dir/install.sh" >"$stdout_file" 2>"$stderr_file"; then
+    ok "install.sh continues after a slow brew tap"
+  else
+    ko "install.sh continues after a slow brew tap" "install.sh aborted after slow tap"
+  fi
+  finished_at="$(date +%s)"
+  elapsed=$((finished_at - started_at))
+
+  if [[ "$elapsed" -lt 4 ]]; then
+    ok "install.sh bounds slow brew tap duration"
+  else
+    ko "install.sh bounds slow brew tap duration" "elapsed ${elapsed}s despite BREW_TAP_TIMEOUT_SECONDS=1"
+  fi
+
+  if grep -Fxq 'install git' "$brew_log"; then
+    ok "install.sh keeps installing formulae after a slow tap"
+  else
+    ko "install.sh keeps installing formulae after a slow tap" "brew install git was skipped"
+  fi
+
+  if grep -Fq 'Command timed out after 1s: brew tap jordandtap/stuck' "$stderr_file"; then
+    ok "install.sh reports the timed-out brew tap"
+  else
+    ko "install.sh reports the timed-out brew tap" "missing timeout message"
+  fi
+}
+
+test_install_continues_when_brew_update_fails() {
+  setup_case "install_brew_update_failure"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": [],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "brew-update-failure", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/install_brew_update_failure/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "brew update failure test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "brew update failure test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local fake_prefix="${TEST_DIR}/install_brew_update_failure/homebrew"
+  local fake_bin="${TEST_DIR}/install_brew_update_failure/bin"
+  local dry_home="${TEST_DIR}/install_brew_update_failure/new-home"
+  local brew_log="${TEST_DIR}/install_brew_update_failure/brew.log"
+  local stdout_file="${TEST_DIR}/install_brew_update_failure/install.stdout"
+  local stderr_file="${TEST_DIR}/install_brew_update_failure/install.stderr"
+  mkdir -p "${fake_prefix}/bin" "$fake_bin" "$dry_home"
+
+  cat > "${fake_prefix}/bin/brew" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${BREW_LOG:?}"
+case "${1:-}" in
+  shellenv)
+    exit 0
+    ;;
+  update)
+    exit 42
+    ;;
+  upgrade)
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "${fake_prefix}/bin/brew"
+
+  cat > "${fake_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${fake_bin}/sudo"
+
+  if HOME="$dry_home" BREW_LOG="$brew_log" DOTFRIEND_BREW_PREFIX="$fake_prefix" PATH="${fake_bin}:${fake_prefix}/bin:/usr/bin:/bin:/usr/sbin:/sbin" BREW_UPGRADE=true INSTALL_DOTFRIEND=false "$repo_dir/install.sh" >"$stdout_file" 2>"$stderr_file"; then
+    ok "install.sh continues when brew update fails"
+  else
+    ko "install.sh continues when brew update fails" "install.sh aborted after brew update failure"
+  fi
+
+  if grep -Fxq update "$brew_log" && grep -Fxq upgrade "$brew_log"; then
+    ok "install.sh still attempts brew upgrade after update failure"
+  else
+    ko "install.sh still attempts brew upgrade after update failure" "brew upgrade was skipped"
+  fi
+
+  if grep -Fq 'Command failed: brew update' "$stderr_file"; then
+    ok "install.sh records failed brew update"
+  else
+    ko "install.sh records failed brew update" "missing brew update failure message"
+  fi
+}
+
+test_generated_restore_artifacts_are_portable_and_package_safe() {
+  setup_case "restore_artifacts"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [
+    "Karabiner-Elements|cask:karabiner-elements|cask",
+    "Karabiner-EventViewer|cask:karabiner-elements|cask",
+    "Spotify|cask:spotify|cask",
+    "Auto Export|mas:Auto Export,id:1115567069|mas"
+  ],
+  "agents": [],
+  "formulae": ["git", "jolt", "git", "jq"],
+  "taps": ["alpha/tap", "jordond/tap", "alpha/tap"],
+  "npm_globals": ["@biomejs/biome@2.4.12", "@openai/codex", "typescript@5.0.0"],
+  "dotfiles": [],
+  "config_dirs": ["sample"],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "restore-artifacts", "private": true}
+}
+EOF
+  mkdir -p "${HOME}/.config/sample"
+  printf 'setting=true\n' > "${HOME}/.config/sample/settings.conf"
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/restore_artifacts/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "restore artifact test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "restore artifact test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  if grep -Fq 'BACKUP_ROOT="${BACKUP_ROOT:-${HOME}/.dotfiles-backup}"' "${repo_dir}/install.sh" \
+    && ! grep -Fq "BACKUP_ROOT=\"${HOME}/.dotfiles-backup\"" "${repo_dir}/install.sh"; then
+    ok "install.sh keeps BACKUP_ROOT runtime-configurable"
+  else
+    ko "install.sh keeps BACKUP_ROOT runtime-configurable" "source machine backup path was embedded"
+  fi
+
+  if find "$repo_dir" -type f -perm -111 -print0 | xargs -0 grep -I -E '\{\{[A-Z0-9_:-]+\}\}' >/dev/null 2>&1; then
+    ko "generated executable scripts contain no unresolved placeholders" "found {{...}} in executable script"
+  else
+    ok "generated executable scripts contain no unresolved placeholders"
+  fi
+
+  if grep -Fq 'soft_run npm install -g @biomejs/biome@2.4.12 || true' "${repo_dir}/install.sh" \
+    && grep -Fq 'soft_run npm install -g @openai/codex || true' "${repo_dir}/install.sh" \
+    && grep -Fq 'soft_run npm install -g typescript@5.0.0 || true' "${repo_dir}/install.sh" \
+    && ! grep -Eq 'npm install -g[[:space:]]+(\|\||$)' "${repo_dir}/install.sh"; then
+    ok "scoped npm globals render usable install commands"
+  else
+    ko "scoped npm globals render usable install commands" "missing scoped package or blank npm install"
+  fi
+
+  if [[ -f "${repo_dir}/npm-global.txt" ]] \
+    && grep -Fxq '@biomejs/biome@2.4.12' "${repo_dir}/npm-global.txt" \
+    && grep -Fxq '@openai/codex' "${repo_dir}/npm-global.txt"; then
+    ok "npm globals are written as generated package metadata"
+  else
+    ko "npm globals are written as generated package metadata" "missing npm-global.txt entries"
+  fi
+
+  local brewfile="${repo_dir}/Brewfile"
+  if [[ "$(grep -Fx 'tap "alpha/tap"' "$brewfile" | wc -l | tr -d ' ')" == "1" ]] \
+    && [[ "$(grep -Fx 'brew "git"' "$brewfile" | wc -l | tr -d ' ')" == "1" ]] \
+    && [[ "$(grep -Fx 'cask "karabiner-elements"' "$brewfile" | wc -l | tr -d ' ')" == "1" ]] \
+    && ! grep -Fq 'jordond/tap' "$brewfile" \
+    && ! grep -Fq 'brew "jolt"' "$brewfile"; then
+    ok "Brewfile deduplicates packages and excludes banned stale entries"
+  else
+    ko "Brewfile deduplicates packages and excludes banned stale entries" "duplicate or banned Brewfile entry remained"
+  fi
+
+  if ! jq -e '(.taps // []) | index("jordond/tap")' "${repo_dir}/.dotfriend/selections.json" >/dev/null \
+    && ! jq -e '(.formulae // []) | index("jolt")' "${repo_dir}/.dotfriend/selections.json" >/dev/null; then
+    ok "generated selections exclude banned stale package state"
+  else
+    ko "generated selections exclude banned stale package state" "jolt or jordond/tap remained in generated selections"
+  fi
+
+  if jq -e '.items[] | select(.id == "packages:homebrew" and .repo_path == "Brewfile")' "${repo_dir}/.dotfriend/restore-manifest.json" >/dev/null \
+    && jq -e '.items[] | select(.id == "packages:npm_globals" and .repo_path == "npm-global.txt")' "${repo_dir}/.dotfriend/restore-manifest.json" >/dev/null; then
+    ok "restore manifest covers generated package artifacts"
+  else
+    ko "restore manifest covers generated package artifacts" "missing package manifest items"
+  fi
+
+  if "${repo_dir}/scripts/validate.sh" --dotfriend --json >/dev/null; then
+    ok "generated artifact validation accepts clean generated package state"
+  else
+    ko "generated artifact validation accepts clean generated package state" "validate.sh --dotfriend failed"
+  fi
+
+  local vendored_key_header="${repo_dir}/config/gcloud/virtenv/lib/python3.13/site-packages/cryptography/hazmat/primitives/serialization/ssh.py"
+  mkdir -p "$(dirname "$vendored_key_header")"
+  printf '%s\n' 'OPENSSH_PRIVATE_KEY_HEADER = "BEGIN OPENSSH PRIVATE KEY"' > "$vendored_key_header"
+  if "${repo_dir}/scripts/validate.sh" --dotfriend --json >/dev/null; then
+    ok "generated artifact validation ignores vendored key header literals"
+  else
+    ko "generated artifact validation ignores vendored key header literals" "vendored dependency source tripped secret scan"
+  fi
+
+  local dry_home="${TEST_DIR}/restore_artifacts/new-home"
+  local backup_root="${TEST_DIR}/restore_artifacts/backup-root"
+  local stdout_file="${TEST_DIR}/restore_artifacts/install.stdout"
+  local stderr_file="${TEST_DIR}/restore_artifacts/install.stderr"
+  mkdir -p "$dry_home"
+
+  if HOME="$dry_home" BACKUP_ROOT="$backup_root" DOTFRIEND_BREW_PREFIX="${TEST_DIR}/restore_artifacts/missing-brew" PATH="/usr/bin:/bin:/usr/sbin:/sbin" DRY_RUN=true BREW_UPGRADE=false INSTALL_MAS=false "$repo_dir/install.sh" >"$stdout_file" 2>"$stderr_file"; then
+    ok "generated install.sh dry-run exits cleanly on a fresh PATH"
+  else
+    ko "generated install.sh dry-run exits cleanly on a fresh PATH" "install.sh dry-run failed"
+  fi
+
+  if [[ ! -e "$backup_root" ]]; then
+    ok "install.sh dry-run does not create BACKUP_ROOT"
+  else
+    ko "install.sh dry-run does not create BACKUP_ROOT" "created ${backup_root}"
+  fi
+
+  if grep -Fq '[dry-run] would run: brew tap alpha/tap' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: brew install git' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: brew install --cask karabiner-elements' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: npm install -g @biomejs/biome@2.4.12' "$stdout_file" \
+    && grep -Fq 'Skipping MAS app: Auto Export (INSTALL_MAS=false)' "$stderr_file"; then
+    ok "install.sh dry-run walks Brewfile and npm restore plan"
+  else
+    ko "install.sh dry-run walks Brewfile and npm restore plan" "missing concrete planned action"
+  fi
+}
+
+test_generated_validation_catches_restore_artifact_issues() {
+  setup_case "restore_validation"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": ["Spotify|cask:spotify|cask"],
+  "agents": [],
+  "formulae": ["git"],
+  "taps": ["alpha/tap"],
+  "npm_globals": ["@openai/codex"],
+  "dotfiles": [],
+  "config_dirs": ["sample"],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "restore-validation", "private": true}
+}
+EOF
+  mkdir -p "${HOME}/.config/sample"
+  printf 'setting=true\n' > "${HOME}/.config/sample/settings.conf"
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/restore_validation/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "restore validation test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "restore validation test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  printf '\n{{BROKEN_PLACEHOLDER}}\n' >> "${repo_dir}/bootstrap.sh"
+  printf '\nsoft_run npm install -g  || true\n' >> "${repo_dir}/install.sh"
+  printf 'brew "git"\n' >> "${repo_dir}/Brewfile"
+  printf 'brew "jolt"\n' >> "${repo_dir}/Brewfile"
+  printf 'tap "jordond/tap"\n' >> "${repo_dir}/Brewfile"
+  printf '@broken\n' >> "${repo_dir}/npm-global.txt"
+  printf '{not json\n' > "${repo_dir}/.dotfriend/selections.json"
+  rm -rf "${repo_dir}/config/sample"
+
+  local output_file="${TEST_DIR}/restore_validation/validate.json"
+  if "${repo_dir}/scripts/validate.sh" --dotfriend --json >"$output_file"; then
+    ko "generated artifact validation fails on restore issues" "validate.sh unexpectedly passed"
+  else
+    ok "generated artifact validation fails on restore issues"
+  fi
+
+  if jq -e '
+    [.checks[] | select(.status == "fail") | .name] as $names |
+    ($names | index("generated script placeholders")) and
+    ($names | index("blank npm install commands")) and
+    ($names | index("Brewfile duplicates")) and
+    ($names | index("Brewfile banned entries")) and
+    ($names | index("npm package names")) and
+    ($names | index("selections JSON")) and
+    ($names | index("manifest source paths"))
+  ' "$output_file" >/dev/null; then
+    ok "generated artifact validation reports the expected restore issues"
+  else
+    ko "generated artifact validation reports the expected restore issues" "missing expected validation failures"
+  fi
+
+  local dry_home="${TEST_DIR}/restore_validation/new-home"
+  local stdout_file="${TEST_DIR}/restore_validation/install.stdout"
+  local stderr_file="${TEST_DIR}/restore_validation/install.stderr"
+  mkdir -p "$dry_home"
+  if HOME="$dry_home" DOTFRIEND_BREW_PREFIX="${TEST_DIR}/restore_validation/missing-brew" PATH="/usr/bin:/bin:/usr/sbin:/sbin" DRY_RUN=true BREW_UPGRADE=false INSTALL_MAS=false "$repo_dir/install.sh" >"$stdout_file" 2>"$stderr_file"; then
+    ko "install.sh preflight fails before restore actions on bad generated artifacts" "install.sh unexpectedly passed"
+  else
+    ok "install.sh preflight fails before restore actions on bad generated artifacts"
+  fi
+
+  if ! grep -Fq 'Phase 2: App Setup' "$stdout_file" \
+    && ! grep -Fq '[dry-run] would run: brew install git' "$stdout_file"; then
+    ok "install.sh preflight stops before restore actions"
+  else
+    ko "install.sh preflight stops before restore actions" "restore actions ran after preflight failure"
+  fi
+}
+
+test_install_handles_sudo_copy_and_rsync_safely() {
+  setup_case "install_safety"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": [],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": ["sample"],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "install-safety", "private": true}
+}
+EOF
+  mkdir -p "${HOME}/.config/sample" "${HOME}/.agents/skills/demo"
+  printf 'generated=true\n' > "${HOME}/.config/sample/settings.conf"
+  printf '# demo\n' > "${HOME}/.agents/skills/demo/SKILL.md"
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/install_safety/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "install safety test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "install safety test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local fake_bin="${TEST_DIR}/install_safety/bin"
+  local dry_home="${TEST_DIR}/install_safety/new-home"
+  local brew_log="${TEST_DIR}/install_safety/brew.log"
+  local rsync_log="${TEST_DIR}/install_safety/rsync.log"
+  local stdout_file="${TEST_DIR}/install_safety/install.stdout"
+  local stderr_file="${TEST_DIR}/install_safety/install.stderr"
+  mkdir -p "$fake_bin" "$dry_home/.config/sample" "$dry_home/.agents/skills"
+  printf 'keep=true\n' > "$dry_home/.config/sample/existing.conf"
+  printf 'local\n' > "$dry_home/.agents/skills/local-only.txt"
+
+  cat > "${fake_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  cat > "${fake_bin}/brew" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${BREW_LOG:?}"
+case "${1:-}" in
+  shellenv)
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+  cat > "${fake_bin}/rsync" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${RSYNC_LOG:?}"
+delete=false
+args=()
+for arg in "$@"; do
+  if [[ "$arg" == "--delete" ]]; then
+    delete=true
+    continue
+  fi
+  args+=("$arg")
+done
+src="${args[$((${#args[@]} - 2))]}"
+dest="${args[$((${#args[@]} - 1))]}"
+mkdir -p "$dest"
+if [[ "$delete" == true ]]; then
+  find "$dest" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+fi
+cp -a "${src%/}/." "$dest/"
+EOF
+  chmod +x "${fake_bin}/sudo" "${fake_bin}/brew" "${fake_bin}/rsync"
+
+  if HOME="$dry_home" BREW_LOG="$brew_log" RSYNC_LOG="$rsync_log" PATH="${fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin" BREW_UPGRADE=false INSTALL_DOTFRIEND=false "$repo_dir/install.sh" >"$stdout_file" 2>"$stderr_file"; then
+    ok "install.sh continues when sudo keepalive is unavailable"
+  else
+    ko "install.sh continues when sudo keepalive is unavailable" "install.sh aborted"
+  fi
+
+  if [[ -f "$dry_home/.config/sample/settings.conf" && ! -e "$dry_home/.config/sample/sample/settings.conf" ]]; then
+    ok "_copy restores directory contents without nesting source directory"
+  else
+    ko "_copy restores directory contents without nesting source directory" "directory copy nested unexpectedly"
+  fi
+
+  if [[ -f "$dry_home/.config/sample/existing.conf" ]]; then
+    ok "_copy preserves existing destination files after backup"
+  else
+    ko "_copy preserves existing destination files after backup" "existing destination file was removed"
+  fi
+
+  if [[ -f "$dry_home/.agents/skills/local-only.txt" ]] && ! grep -Fq -- '--delete' "$rsync_log"; then
+    ok "_rsync_agent avoids destructive delete behavior"
+  else
+    ko "_rsync_agent avoids destructive delete behavior" "rsync used --delete or removed local-only file"
+  fi
+}
+
+test_install_exit_status_contract() {
+  setup_case "install_exit_contract"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": ["git"],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "install-exit-contract", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/install_exit_contract/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "install exit contract test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "install exit contract test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local fake_bin="${TEST_DIR}/install_exit_contract/bin"
+  local soft_home="${TEST_DIR}/install_exit_contract/soft-home"
+  local soft_stdout="${TEST_DIR}/install_exit_contract/soft.stdout"
+  local soft_stderr="${TEST_DIR}/install_exit_contract/soft.stderr"
+  mkdir -p "$fake_bin" "$soft_home"
+
+  cat > "${fake_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  cat > "${fake_bin}/brew" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  shellenv|update|upgrade)
+    exit 0
+    ;;
+  install)
+    exit 44
+    ;;
+esac
+exit 0
+EOF
+  chmod +x "${fake_bin}/sudo" "${fake_bin}/brew"
+
+  if HOME="$soft_home" PATH="${fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin" BREW_UPGRADE=false INSTALL_DOTFRIEND=false "$repo_dir/install.sh" >"$soft_stdout" 2>"$soft_stderr"; then
+    ok "soft package restore failures exit zero"
+  else
+    ko "soft package restore failures exit zero" "install.sh returned nonzero for brew install miss"
+  fi
+
+  if grep -Fq 'Command failed: brew install git' "$soft_stderr" && grep -Fq 'warning(s)' "$soft_stdout"; then
+    ok "soft package restore failures are summarized as warnings"
+  else
+    ko "soft package restore failures are summarized as warnings" "missing warning summary for package miss"
+  fi
+
+  local critical_home="${TEST_DIR}/install_exit_contract/critical-home"
+  local critical_bin="${TEST_DIR}/install_exit_contract/critical-bin"
+  local critical_stdout="${TEST_DIR}/install_exit_contract/critical.stdout"
+  local critical_stderr="${TEST_DIR}/install_exit_contract/critical.stderr"
+  mkdir -p "$critical_home" "$critical_bin"
+
+  cat > "${critical_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  cat > "${critical_bin}/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'exit 42\n'
+EOF
+  chmod +x "${critical_bin}/sudo" "${critical_bin}/curl"
+
+  if HOME="$critical_home" PATH="${critical_bin}:/usr/bin:/bin:/usr/sbin:/sbin" BREW_UPGRADE=false INSTALL_DOTFRIEND=false "$repo_dir/install.sh" >"$critical_stdout" 2>"$critical_stderr"; then
+    ko "critical prerequisite failures exit nonzero" "install.sh succeeded after Homebrew install failure"
+  else
+    ok "critical prerequisite failures exit nonzero"
   fi
 }
 
@@ -920,8 +1574,8 @@ EOF
   GEN_NO_PUSH=false
 
   local apps_line config_line
-  apps_line="$(grep -n '^  phase_apps$' "${repo_dir}/install.sh" | head -n1 | cut -d: -f1)"
-  config_line="$(grep -n '^  phase_configuration$' "${repo_dir}/install.sh" | head -n1 | cut -d: -f1)"
+  apps_line="$(grep -n '^  phase_apps' "${repo_dir}/install.sh" | head -n1 | cut -d: -f1)"
+  config_line="$(grep -n '^  phase_configuration' "${repo_dir}/install.sh" | head -n1 | cut -d: -f1)"
   if [[ -n "$apps_line" && -n "$config_line" && "$apps_line" -lt "$config_line" ]]; then
     ok "install.sh runs app setup before config restore"
   else
@@ -945,6 +1599,13 @@ test_generation_state_skips_unchanged_sections
 test_generator_code_changes_invalidate_generated_install_script
 test_macos_defaults_generation_and_apply_script
 test_install_dry_run_plans_restore_dependencies_without_missing_tool_warnings
+test_brewfile_entries_use_real_newlines
+test_install_times_out_slow_brew_taps_and_continues
+test_install_continues_when_brew_update_fails
+test_generated_restore_artifacts_are_portable_and_package_safe
+test_generated_validation_catches_restore_artifact_issues
+test_install_handles_sudo_copy_and_rsync_safely
+test_install_exit_status_contract
 test_install_runs_app_setup_before_config_restore
 
 printf '\n========================================\n'

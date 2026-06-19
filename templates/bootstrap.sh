@@ -114,7 +114,7 @@ install_base_packages() {
     brew install gum || { log_error "Failed to install gum"; }
   fi
 
-  {{BASE_CASKS_BLOCK}}
+  # No base casks are required during bootstrap.
 }
 
 # ─────────────────────────────────────────────────────────────

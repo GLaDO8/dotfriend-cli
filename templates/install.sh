@@ -13,9 +13,10 @@ INSTALL_MAS="{{INSTALL_MAS:-true}}"
 BREW_UPGRADE="{{BREW_UPGRADE:-true}}"
 INSTALL_DOTFRIEND="{{INSTALL_DOTFRIEND:-true}}"
 INSTALL_VALIDATE="{{INSTALL_VALIDATE:-false}}"
+BREW_TAP_TIMEOUT_SECONDS="${BREW_TAP_TIMEOUT_SECONDS:-120}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOTFILES_DIR="${DOTFILES_DIR:-${SCRIPT_DIR}}"
-BACKUP_ROOT="{{BACKUP_ROOT:-${HOME}/.dotfiles-backup}}"
+BACKUP_ROOT="${BACKUP_ROOT:-${HOME}/.dotfiles-backup}"
 DRY_RUN="{{DRY_RUN:-false}}"
 
 # ─────────────────────────────────────────────────────────────
@@ -37,7 +38,7 @@ log_step()  { printf "\\n\\033[1;36m→ %s\\033[0m\\n" "$*"; }
 
 ensure_dir() { [[ -d "$1" ]] || mkdir -p "$1"; }
 
-# Run a command, but on failure log the error and continue
+# Run a command, but on failure log a warning and continue
 soft_run() {
   if [[ "$DRY_RUN" == "true" ]]; then
     printf "  [dry-run] would run: %s\\n" "$*"
@@ -46,9 +47,102 @@ soft_run() {
   if "$@"; then
     return 0
   else
-    log_error "Command failed: $*"
+    log_warn "Command failed: $*"
     return 1
   fi
+}
+
+brew_tap_timeout_seconds() {
+  local seconds="$BREW_TAP_TIMEOUT_SECONDS"
+  if [[ ! "$seconds" =~ ^[0-9]+$ || "$seconds" -lt 1 ]]; then
+    seconds=120
+  fi
+  printf '%s' "$seconds"
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    set +e
+    timeout "$seconds" "$@"
+    local status=$?
+    set -e
+    return "$status"
+  fi
+
+  if command -v gtimeout >/dev/null 2>&1; then
+    set +e
+    gtimeout "$seconds" "$@"
+    local status=$?
+    set -e
+    return "$status"
+  fi
+
+  if command -v perl >/dev/null 2>&1; then
+    set +e
+    perl -e '
+      use POSIX ":sys_wait_h";
+      my $seconds = shift @ARGV;
+      $seconds = 120 unless defined($seconds) && $seconds =~ /^[0-9]+$/ && $seconds > 0;
+      my $pid = fork();
+      exit 127 unless defined $pid;
+      if ($pid == 0) {
+        setpgrp(0, 0);
+        exec @ARGV;
+        exit 127;
+      }
+      my $deadline = time() + $seconds;
+      while (1) {
+        my $done = waitpid($pid, WNOHANG);
+        if ($done == $pid) {
+          my $status = $?;
+          exit(128 + ($status & 127)) if ($status & 127);
+          exit($status >> 8);
+        }
+        if (time() >= $deadline) {
+          kill "TERM", -$pid;
+          select undef, undef, undef, 0.2;
+          exit 124 if waitpid($pid, WNOHANG) == $pid;
+          kill "KILL", -$pid;
+          waitpid($pid, 0);
+          exit 124;
+        }
+        select undef, undef, undef, 0.1;
+      }
+    ' "$seconds" "$@"
+    local status=$?
+    set -e
+    return "$status"
+  fi
+
+  "$@"
+}
+
+soft_run_brew_tap() {
+  local tap="$1"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    soft_run brew tap "$tap"
+    return 0
+  fi
+
+  local seconds status started_at finished_at elapsed
+  seconds="$(brew_tap_timeout_seconds)"
+  started_at="$(date +%s)"
+  if run_with_timeout "$seconds" brew tap "$tap"; then
+    return 0
+  fi
+  status=$?
+  finished_at="$(date +%s)"
+  elapsed=$((finished_at - started_at))
+
+  if [[ "$status" -eq 124 || "$status" -eq 137 || "$status" -eq 143 || "$elapsed" -ge "$seconds" ]]; then
+    log_error "Command timed out after ${seconds}s: brew tap ${tap}"
+  else
+    log_error "Command failed: brew tap ${tap}"
+  fi
+  return 1
 }
 
 backup_file() {
@@ -101,6 +195,25 @@ ensure_brew_package() {
 }
 
 # ─────────────────────────────────────────────────────────────
+# Preflight: generated restore artifacts
+# ─────────────────────────────────────────────────────────────
+
+phase_preflight() {
+  log_step "Preflight: Generated Restore Artifacts"
+  local validate_script="${DOTFILES_DIR}/scripts/validate.sh"
+  if [[ ! -x "$validate_script" ]]; then
+    log_error "Generated restore validation script is missing or not executable"
+    return 1
+  fi
+  if "$validate_script" --dotfriend --json >/dev/null; then
+    log_ok "Generated restore artifacts look valid"
+    return 0
+  fi
+  log_error "Generated restore artifact validation failed; run ${validate_script} --dotfriend for details"
+  return 1
+}
+
+# ─────────────────────────────────────────────────────────────
 # Phase 0: Sudo keepalive
 # ─────────────────────────────────────────────────────────────
 
@@ -109,9 +222,16 @@ start_sudo_keepalive() {
     log_info "[dry-run] Would start sudo keepalive"
     return 0
   fi
-  sudo -v
+  if ! command -v sudo >/dev/null 2>&1; then
+    log_warn "sudo not found; continuing without keepalive"
+    return 0
+  fi
+  if ! sudo -v; then
+    log_warn "sudo permission was not granted; continuing with user-space restore"
+    return 0
+  fi
   while true; do
-    sudo -n true
+    sudo -n true || exit 0
     sleep 60
     kill -0 "$$" || exit
   done 2>/dev/null &
@@ -148,8 +268,8 @@ phase_prerequisites() {
 
   # Upgrade if requested
   if [[ "$BREW_UPGRADE" == "true" ]]; then
-    soft_run brew update
-    soft_run brew upgrade
+    soft_run brew update || true
+    soft_run brew upgrade || true
   fi
 }
 
@@ -223,35 +343,31 @@ phase_apps() {
   # Brewfile
   local brewfile="${DOTFILES_DIR}/Brewfile"
   if [[ -f "$brewfile" ]]; then
-    if [[ "$DRY_RUN" == "true" ]]; then
-      log_info "[dry-run] Would brew bundle from ${brewfile}"
-    else
-      log_info "Installing from Brewfile..."
-      # Install line-by-line for soft-fail
-      while IFS= read -r line || [[ -n "$line" ]]; do
-        line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-        [[ -z "$line" || "$line" == \#* ]] && continue
-        local item; item="$(printf '%s' "$line" | sed 's/^[^"]*"\([^"]*\)".*/\1/')"
-        if [[ "$line" == tap* ]]; then
-          printf "  Installing tap: %s\\n" "$item"
-          soft_run brew tap "$item" || true
-        elif [[ "$line" == brew* ]]; then
-          printf "  Installing formula: %s\\n" "$item"
-          soft_run brew install "$item" || true
-        elif [[ "$line" == cask* ]]; then
-          printf "  Installing cask: %s\\n" "$item"
-          soft_run brew install --cask "$item" || true
-        elif [[ "$line" == mas* ]]; then
-          if [[ "$INSTALL_MAS" == "true" ]]; then
-            local app_id; app_id="$(printf '%s' "$line" | grep -oE '[0-9]+' | head -n1)"
-            printf "  Installing MAS app: %s\\n" "$app_id"
-            soft_run mas install "$app_id" || true
-          else
-            log_warn "Skipping MAS app: $item (INSTALL_MAS=false)"
-          fi
+    log_info "Installing from Brewfile..."
+    # Install line-by-line for soft-fail and dry-run previews.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      local item; item="$(printf '%s' "$line" | sed 's/^[^"]*"\([^"]*\)".*/\1/')"
+      if [[ "$line" == tap* ]]; then
+        printf "  Installing tap: %s\\n" "$item"
+        soft_run_brew_tap "$item" || true
+      elif [[ "$line" == brew* ]]; then
+        printf "  Installing formula: %s\\n" "$item"
+        soft_run brew install "$item" || true
+      elif [[ "$line" == cask* ]]; then
+        printf "  Installing cask: %s\\n" "$item"
+        soft_run brew install --cask "$item" || true
+      elif [[ "$line" == mas* ]]; then
+        if [[ "$INSTALL_MAS" == "true" ]]; then
+          local app_id; app_id="$(printf '%s' "$line" | grep -oE '[0-9]+' | head -n1)"
+          printf "  Installing MAS app: %s\\n" "$app_id"
+          soft_run mas install "$app_id" || true
+        else
+          log_warn "Skipping MAS app: $item (INSTALL_MAS=false)"
         fi
-      done < "$brewfile"
-    fi
+      fi
+    done < "$brewfile"
   fi
 
   # npm globals
@@ -271,7 +387,9 @@ phase_apps() {
 phase_configuration() {
   log_step "Phase 3: Configuration"
 
-  ensure_dir "$BACKUP_ROOT"
+  if [[ "$DRY_RUN" != "true" ]]; then
+    ensure_dir "$BACKUP_ROOT"
+  fi
 
   # Symlinks
   {{SYMLINKS_BLOCK}}
@@ -279,7 +397,7 @@ phase_configuration() {
   # Copies (app-managed files)
   {{COPIES_BLOCK}}
 
-  # Agent configs (rsync --delete)
+  # Agent configs (rsync)
   {{AGENT_RSYNC_BLOCK}}
 }
 
@@ -310,19 +428,28 @@ _copy() {
   if [[ -e "$dest" ]]; then
     backup_file "$dest"
   fi
-  ensure_dir "$(dirname "$dest")"
-  cp -a "$src" "$dest" || { log_error "Failed to copy $src to $dest"; return 1; }
+  if [[ -d "$src" ]]; then
+    ensure_dir "$dest"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a "${src}/" "${dest}/" || { log_error "Failed to copy $src to $dest"; return 1; }
+    else
+      cp -a "$src/." "$dest/" || { log_error "Failed to copy $src to $dest"; return 1; }
+    fi
+  else
+    ensure_dir "$(dirname "$dest")"
+    cp -a "$src" "$dest" || { log_error "Failed to copy $src to $dest"; return 1; }
+  fi
   log_ok "Copied $src → $dest"
 }
 
 _rsync_agent() {
   local src="$1" dest="$2"
   if [[ "$DRY_RUN" == "true" ]]; then
-    printf "  [dry-run] would rsync --delete %s/ → %s/\\n" "$src" "$dest"
+    printf "  [dry-run] would rsync %s/ → %s/\\n" "$src" "$dest"
     return 0
   fi
   ensure_dir "$dest"
-  rsync -a --delete "${src}/" "${dest}/" || { log_error "Failed to rsync $src to $dest"; return 1; }
+  rsync -a "${src}/" "${dest}/" || { log_error "Failed to rsync $src to $dest"; return 1; }
   log_ok "Rsynced $src → $dest"
 }
 
@@ -409,14 +536,26 @@ main() {
     esac
   done
 
-  start_sudo_keepalive
-  phase_prerequisites
-  phase_dotfriend
-  phase_apps
-  phase_configuration
-  phase_final
-  phase_validation
+  local status=0
+
+  if ! phase_preflight; then
+    status=1
+    print_summary
+    return "$status"
+  fi
+  start_sudo_keepalive || true
+  if ! phase_prerequisites; then
+    status=1
+    print_summary
+    return "$status"
+  fi
+  phase_dotfriend || status=1
+  phase_apps || status=1
+  phase_configuration || status=1
+  phase_final || status=1
+  phase_validation || status=1
   print_summary
+  return "$status"
 }
 
 main "$@"

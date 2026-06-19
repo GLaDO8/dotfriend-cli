@@ -133,6 +133,25 @@ brew_is_installed() {
     brew list --cask "$name" >/dev/null 2>&1
 }
 
+npm_package_name_from_spec() {
+  local pkg="$1"
+  if [[ "$pkg" == @* ]]; then
+    if [[ "$pkg" =~ ^(@[^/@[:space:]]+/[^@[:space:]]+)(@[^[:space:]]+)?$ ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  elif [[ "$pkg" =~ ^([^@[:space:]]+)(@[^[:space:]]+)?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+line_set_contains() {
+  local lines="$1" needle="$2"
+  printf '%s' "$lines" | grep -Fxq -- "$needle"
+}
+
 read_link() {
   if command -v readlink >/dev/null 2>&1; then
     readlink -f "$1" 2>/dev/null || readlink "$1" 2>/dev/null || true
@@ -373,9 +392,10 @@ run_check_npm() {
     pkg="${pkg%%#*}"
     pkg="$(printf '%s' "$pkg" | xargs 2>/dev/null || true)"
     [[ -z "$pkg" ]] && continue
-    name="${pkg%%@*}"
-    version="${pkg#*@}"
-    [[ "$name" == "$version" ]] && version=""
+    if ! name="$(npm_package_name_from_spec "$pkg")"; then
+      record "npm: $pkg" "fail" "Malformed package spec"
+      continue
+    fi
 
     if npm list -g --depth=0 "$name" >/dev/null 2>&1; then
       record "npm: $name" "pass" "Package is installed"
@@ -399,6 +419,7 @@ run_check_npm() {
 run_check_dotfriend_metadata() {
   local manifest="${REPO_ROOT}/.dotfriend/restore-manifest.json"
   local artifacts="${REPO_ROOT}/.dotfriend/agent-artifacts.json"
+  local selections="${REPO_ROOT}/.dotfriend/selections.json"
 
   if [[ ! -f "$manifest" ]]; then
     record "restore manifest" "fail" ".dotfriend/restore-manifest.json is missing"
@@ -427,6 +448,117 @@ run_check_dotfriend_metadata() {
     record "restore target paths" "fail" "disallowed target_path: $bad_target_path"
   else
     record "restore target paths" "pass" "all target paths are allowed"
+  fi
+
+  local missing_source
+  missing_source="$(jq -r '.items[]? | select(.selected != false) | .repo_path // empty' "$manifest" | while IFS= read -r p; do [[ -z "$p" ]] && continue; [[ -e "${REPO_ROOT}/${p}" ]] || { printf '%s\n' "$p"; break; }; done)"
+  if [[ -n "$missing_source" ]]; then
+    record "manifest source paths" "fail" "missing repo source: $missing_source"
+  else
+    record "manifest source paths" "pass" "all manifest repo sources exist"
+  fi
+
+  if [[ -f "$selections" ]]; then
+    if json_ok "$selections"; then
+      record "selections JSON" "pass" "selections.json is valid JSON"
+    else
+      record "selections JSON" "fail" "selections.json is not valid JSON"
+    fi
+  else
+    record "selections JSON" "warn" ".dotfriend/selections.json is missing"
+  fi
+
+  local generated_script placeholder_file blank_npm_file
+  placeholder_file=""
+  blank_npm_file=""
+  for generated_script in "${REPO_ROOT}/install.sh" "${REPO_ROOT}/bootstrap.sh" "${REPO_ROOT}"/scripts/*.sh; do
+    [[ -f "$generated_script" ]] || continue
+    if [[ -z "$placeholder_file" ]] && grep -I -E '\{\{[A-Z0-9_:-]+\}\}' "$generated_script" >/dev/null 2>&1; then
+      placeholder_file="${generated_script#${REPO_ROOT}/}"
+    fi
+    if [[ -z "$blank_npm_file" ]] && grep -I -E 'npm install -g[[:space:]]*($|\|\|)' "$generated_script" >/dev/null 2>&1; then
+      blank_npm_file="${generated_script#${REPO_ROOT}/}"
+    fi
+  done
+  if [[ -n "$placeholder_file" ]]; then
+    record "generated script placeholders" "fail" "unresolved placeholder in $placeholder_file"
+  else
+    record "generated script placeholders" "pass" "no unresolved generated placeholders"
+  fi
+  if [[ -n "$blank_npm_file" ]]; then
+    record "blank npm install commands" "fail" "blank npm install in $blank_npm_file"
+  else
+    record "blank npm install commands" "pass" "no blank npm install commands"
+  fi
+
+  local brewfile="${REPO_ROOT}/Brewfile"
+  if [[ -f "$brewfile" ]]; then
+    local dupes="" banned="" line kind item key
+    local seen_brew_entries=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -z "$line" ]] && continue
+      case "$line" in
+        tap\ *|brew\ *|cask\ *|mas\ *)
+          kind="${line%% *}"
+          item="$(printf '%s' "$line" | sed 's/^[^"]*"\([^"]*\)".*/\1/')"
+          if [[ "$kind" == "mas" ]]; then
+            item="$(printf '%s' "$line" | grep -oE 'id:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -n1)"
+          fi
+          [[ -z "$item" ]] && continue
+          key="${kind}:${item}"
+          if line_set_contains "$seen_brew_entries" "$key" && [[ -z "$dupes" ]]; then
+            dupes="$key"
+          fi
+          seen_brew_entries="${seen_brew_entries}${key}"$'\n'
+          case "$key" in
+            tap:jordond/tap|brew:jolt)
+              [[ -z "$banned" ]] && banned="$key"
+              ;;
+          esac
+          ;;
+      esac
+    done < "$brewfile"
+    if [[ -n "$dupes" ]]; then
+      record "Brewfile duplicates" "fail" "duplicate entry: $dupes"
+    else
+      record "Brewfile duplicates" "pass" "no duplicate package entries"
+    fi
+    if [[ -n "$banned" ]]; then
+      record "Brewfile banned entries" "fail" "banned stale entry: $banned"
+    else
+      record "Brewfile banned entries" "pass" "no banned stale package entries"
+    fi
+    if ! jq -e '.items[]? | select(.id == "packages:homebrew" and .repo_path == "Brewfile")' "$manifest" >/dev/null; then
+      record "package manifest: homebrew" "fail" "Brewfile is not covered by restore manifest"
+    else
+      record "package manifest: homebrew" "pass" "Brewfile is covered by restore manifest"
+    fi
+  fi
+
+  local npmfile="${REPO_ROOT}/npm-global.txt"
+  if [[ -f "$npmfile" ]]; then
+    local bad_npm=""
+    while IFS= read -r pkg || [[ -n "$pkg" ]]; do
+      pkg="${pkg%%#*}"
+      pkg="$(printf '%s' "$pkg" | xargs 2>/dev/null || true)"
+      [[ -z "$pkg" ]] && continue
+      if ! npm_package_name_from_spec "$pkg" >/dev/null; then
+        bad_npm="$pkg"
+        break
+      fi
+    done < "$npmfile"
+    if [[ -n "$bad_npm" ]]; then
+      record "npm package names" "fail" "malformed package spec: $bad_npm"
+    else
+      record "npm package names" "pass" "npm package specs are valid"
+    fi
+    if ! jq -e '.items[]? | select(.id == "packages:npm_globals" and .repo_path == "npm-global.txt")' "$manifest" >/dev/null; then
+      record "package manifest: npm" "fail" "npm-global.txt is not covered by restore manifest"
+    else
+      record "package manifest: npm" "pass" "npm-global.txt is covered by restore manifest"
+    fi
   fi
 
   if jq -e '.items[]? | select(.type == "macos_defaults")' "$manifest" >/dev/null; then
@@ -481,7 +613,11 @@ run_check_dotfriend_metadata() {
     record "agent artifacts" "warn" ".dotfriend/agent-artifacts.json is missing"
   fi
 
-  if find "$REPO_ROOT" -path "${REPO_ROOT}/.git" -prune -o -type f ! -name '*.dotfriend.bak' -print0 2>/dev/null |
+  if find "$REPO_ROOT" \
+    -path "${REPO_ROOT}/.git" -prune -o \
+    -path '*/node_modules' -prune -o \
+    -path '*/site-packages' -prune -o \
+    -type f ! -name '*.dotfriend.bak' -print0 2>/dev/null |
     xargs -0 grep -I -E '(BEGIN (RSA|OPENSSH|DSA|EC) PRIVATE KEY|ghp_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|GITHUB_TOKEN=[A-Za-z0-9_]{10,})' >/dev/null 2>&1; then
     record "plaintext secrets" "fail" "obvious secret-looking value found"
   else
@@ -549,6 +685,9 @@ if [[ "$OUTPUT_JSON" == true ]]; then
     printf '    }'
   done
   printf '\n  ]\n}\n'
+  if [[ "$total_fail" -gt 0 ]]; then
+    exit 1
+  fi
 else
   printf '\n'
   printf '%bValidation Results%b\n' "$C_BOLD" "$C_RESET"

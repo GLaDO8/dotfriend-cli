@@ -258,6 +258,41 @@ _print_command_failure_log() {
   done < "$logfile"
 }
 
+_brew_entry_is_banned() {
+  local kind="$1" item="$2"
+  case "${kind}:${item}" in
+    tap:jordond/tap|brew:jolt)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+_npm_package_name_from_spec() {
+  local pkg="$1"
+  if [[ "$pkg" == @* ]]; then
+    if [[ "$pkg" =~ ^(@[^/@[:space:]]+/[^@[:space:]]+)(@[^[:space:]]+)?$ ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  elif [[ "$pkg" =~ ^([^@[:space:]]+)(@[^[:space:]]+)?$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+_npm_package_spec_is_valid() {
+  _npm_package_name_from_spec "$1" >/dev/null
+}
+
+_line_set_contains() {
+  local lines="$1" needle="$2"
+  printf '%s' "$lines" | grep -Fxq -- "$needle"
+}
+
 # ─────────────────────────────────────────────────────────────
 # File generation helpers
 # ─────────────────────────────────────────────────────────────
@@ -274,9 +309,13 @@ _generate_brewfile() {
     local taps; taps="$(_jq_str "$SELECTIONS_FILE" '.taps | if . then join("\n") else "" end')"
     if [[ -n "$taps" ]]; then
       printf "# Taps\\n"
+      local seen_taps=""
       while IFS= read -r tap; do
         [[ -z "$tap" ]] && continue
-        printf 'tap "%s"\\n' "$tap"
+        _brew_entry_is_banned tap "$tap" && continue
+        _line_set_contains "$seen_taps" "$tap" && continue
+        seen_taps="${seen_taps}${tap}"$'\n'
+        printf 'tap "%s"\n' "$tap"
       done <<< "$taps"
       printf "\\n"
     fi
@@ -285,24 +324,33 @@ _generate_brewfile() {
     local formulae; formulae="$(_jq_str "$SELECTIONS_FILE" '.formulae | if . then join("\n") else "" end')"
     if [[ -n "$formulae" ]]; then
       printf "# Formulae\\n"
+      local seen_formulae=""
       while IFS= read -r f; do
         [[ -z "$f" ]] && continue
-        printf 'brew "%s"\\n' "$f"
+        _brew_entry_is_banned brew "$f" && continue
+        _line_set_contains "$seen_formulae" "$f" && continue
+        seen_formulae="${seen_formulae}${f}"$'\n'
+        printf 'brew "%s"\n' "$f"
       done <<< "$formulae"
       printf "\\n"
     fi
 
     # Casks (from apps)
-    local apps_json; apps_json="$(_jq_str "$SELECTIONS_FILE" '.apps')"
+    local apps_json; apps_json="$(_jq_str "$SELECTIONS_FILE" '.apps[]?')"
     if [[ -n "$apps_json" ]]; then
       printf "# Casks\\n"
+      local seen_casks=""
       while IFS= read -r app; do
         [[ -z "$app" ]] && continue
         # app format from wizard: "App Name|cask:token|cask" or "App Name|mas:token,id:123|mas"
         if [[ "$app" == *"|cask:"* ]]; then
           local cask; cask="${app#*|cask:}"
           cask="${cask%%|*}"
-          printf 'cask "%s"\\n' "$cask"
+          [[ -z "$cask" ]] && continue
+          _brew_entry_is_banned cask "$cask" && continue
+          _line_set_contains "$seen_casks" "$cask" && continue
+          seen_casks="${seen_casks}${cask}"$'\n'
+          printf 'cask "%s"\n' "$cask"
         fi
       done <<< "$apps_json"
       printf "\\n"
@@ -311,6 +359,7 @@ _generate_brewfile() {
     # MAS apps
     if [[ -n "$apps_json" ]]; then
       printf "# Mac App Store\\n"
+      local seen_mas=""
       while IFS= read -r app; do
         [[ -z "$app" ]] && continue
         if [[ "$app" == *"|mas:"* ]]; then
@@ -319,7 +368,10 @@ _generate_brewfile() {
           local mas_name mas_id
           mas_name="${mas_part%%,*}"
           mas_id="${mas_part##*id:}"
-          printf 'mas "%s", id: %s\\n' "$mas_name" "$mas_id"
+          [[ -z "$mas_name" || -z "$mas_id" ]] && continue
+          _line_set_contains "$seen_mas" "$mas_id" && continue
+          seen_mas="${seen_mas}${mas_id}"$'\n'
+          printf 'mas "%s", id: %s\n' "$mas_name" "$mas_id"
         fi
       done <<< "$apps_json"
       printf "\\n"
@@ -330,6 +382,35 @@ _generate_brewfile() {
   } > "$out"
 
   log_ok "Brewfile generated"
+}
+
+_generate_npm_globals_file() {
+  local out="${GEN_DIR}/npm-global.txt"
+  local npm; npm="$(_jq_str "$SELECTIONS_FILE" '.npm_globals | if . then join("\n") else "" end')"
+
+  if [[ -z "$npm" ]]; then
+    rm -f "$out"
+    return 0
+  fi
+
+  log_info "Generating npm globals..."
+  local seen_npm=""
+  : > "$out"
+  while IFS= read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    if ! _npm_package_spec_is_valid "$pkg"; then
+      log_warn "Skipping malformed npm package: $pkg"
+      continue
+    fi
+    _line_set_contains "$seen_npm" "$pkg" && continue
+    seen_npm="${seen_npm}${pkg}"$'\n'
+    printf '%s\n' "$pkg" >> "$out"
+  done <<< "$npm"
+
+  if [[ ! -s "$out" ]]; then
+    rm -f "$out"
+  fi
+  log_ok "npm globals generated"
 }
 
 _replace_placeholder() {
@@ -356,8 +437,6 @@ _generate_install_sh() {
   cp "$template" "$out"
 
   # Substitute basic placeholders
-  local repo_name; repo_name="$(_selected_repo_name)"
-  sed -i.bak "s|{{BACKUP_ROOT:-\${HOME}/.dotfiles-backup}}|${GEN_BACKUP_ROOT}|g" "$out"
   sed -i.bak 's|{{INSTALL_MAS:-true}}|${INSTALL_MAS:-true}|g' "$out"
   sed -i.bak 's|{{BREW_UPGRADE:-true}}|${BREW_UPGRADE:-true}|g' "$out"
   sed -i.bak 's|{{INSTALL_DOTFRIEND:-true}}|${INSTALL_DOTFRIEND:-true}|g' "$out"
@@ -557,7 +636,16 @@ _generate_repo_metadata() {
 
   ensure_dir "$metadata_dir"
   cp "${SCRIPT_DIR}/agent-tools.json" "${metadata_dir}/agent-tools.json"
-  cp "$SELECTIONS_FILE" "${metadata_dir}/selections.json"
+  if command -v jq >/dev/null 2>&1; then
+    jq '
+      def uniq_order: reduce .[] as $x ([]; if index($x) then . else . + [$x] end);
+      .taps = ((.taps // []) | map(select(. != "jordond/tap")) | uniq_order)
+      | .formulae = ((.formulae // []) | map(select(. != "jolt")) | uniq_order)
+      | .npm_globals = ((.npm_globals // []) | uniq_order)
+    ' "$SELECTIONS_FILE" > "${metadata_dir}/selections.json"
+  else
+    cp "$SELECTIONS_FILE" "${metadata_dir}/selections.json"
+  fi
 
   log_ok "Repo metadata generated"
 }
@@ -818,10 +906,15 @@ _build_npm_block() {
   if [[ -n "$npm" ]]; then
     printf '  ensure_brew_package npm node "npm global packages"\n'
     printf '  if [[ "$DRY_RUN" == "true" || "$(command -v npm || true)" != "" ]]; then\n'
+    local seen_npm=""
     while IFS= read -r pkg; do
       [[ -z "$pkg" ]] && continue
-      local pkg_name; pkg_name="${pkg%%@*}"
-      printf "    soft_run npm install -g %s || true\n" "$pkg_name"
+      if ! _npm_package_spec_is_valid "$pkg"; then
+        continue
+      fi
+      _line_set_contains "$seen_npm" "$pkg" && continue
+      seen_npm="${seen_npm}${pkg}"$'\n'
+      printf "    soft_run npm install -g %s || true\n" "$pkg"
     done <<< "$npm"
     printf "  else\n"
     printf "    log_warn \"npm not found; skipping npm global installs\"\n"
@@ -1323,6 +1416,7 @@ generate_repo() {
   log_info "Target directory: ${GEN_DIR}"
 
   _generation_run_section "brewfile" "Generating package list" _generate_brewfile
+  _generation_run_section "npm_globals" "Generating npm package list" _generate_npm_globals_file
   _generation_run_section "install_script" "Generating install script" _generate_install_sh
   _generation_run_section "bootstrap_script" "Generating bootstrap script" _generate_bootstrap_sh
   _generation_run_section "gitignore" "Generating ignore rules" _generate_gitignore

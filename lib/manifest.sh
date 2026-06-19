@@ -153,6 +153,40 @@ manifest_write_for_generated_repo() {
         }
       ] else [] end;
 
+    def package_artifacts:
+      def uniq_order: reduce .[] as $x ([]; if index($x) then . else . + [$x] end);
+      [
+        {
+          id: "packages:homebrew",
+          type: "homebrew_packages",
+          restore_mode: "install_only",
+          repo_path: "Brewfile",
+          target_path: "~/.dotfriend/packages/homebrew",
+          selected: true,
+          requires_approval: false,
+          metadata: {
+            taps: (($selections.taps // []) | map(select(. != "jordond/tap")) | uniq_order),
+            formulae: (($selections.formulae // []) | map(select(. != "jolt")) | uniq_order),
+            casks: (($selections.apps // []) | map(select(contains("|cask:")) | split("|cask:")[1] | split("|")[0]) | uniq_order),
+            mas: (($selections.apps // []) | map(select(contains("|mas:")) | split("|mas:")[1] | split("|")[0]) | uniq_order)
+          }
+        }
+      ]
+      + (if (($selections.npm_globals // []) | length) > 0 then [
+        {
+          id: "packages:npm_globals",
+          type: "npm_globals",
+          restore_mode: "install_only",
+          repo_path: "npm-global.txt",
+          target_path: "~/.dotfriend/packages/npm",
+          selected: true,
+          requires_approval: false,
+          metadata: {
+            packages: ($selections.npm_globals // [])
+          }
+        }
+      ] else [] end);
+
     {
       schema_version: 1,
       generated_by: "dotfriend",
@@ -164,6 +198,7 @@ manifest_write_for_generated_repo() {
         + selected_agents
         + editor_extensions
         + selected_macos_defaults
+        + package_artifacts
         + [
           {
             id: "agent_shared_store:skills",
