@@ -15,6 +15,7 @@ INSTALL_DOTFRIEND="{{INSTALL_DOTFRIEND:-true}}"
 INSTALL_VALIDATE="{{INSTALL_VALIDATE:-false}}"
 BREW_TAP_TIMEOUT_SECONDS="${BREW_TAP_TIMEOUT_SECONDS:-120}"
 TRUST_BREW_TAPS="${TRUST_BREW_TAPS:-true}"
+BREW_NO_ASK="${BREW_NO_ASK:-true}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOTFILES_DIR="${DOTFILES_DIR:-${SCRIPT_DIR}}"
 BACKUP_ROOT="${BACKUP_ROOT:-${HOME}/.dotfiles-backup}"
@@ -51,6 +52,15 @@ soft_run() {
     log_warn "Command failed: $*"
     return 1
   fi
+}
+
+brew_install() {
+  local -a args=(install)
+  if [[ "$BREW_NO_ASK" == "true" ]]; then
+    args+=(--no-ask)
+  fi
+  args+=("$@")
+  soft_run brew "${args[@]}"
 }
 
 brew_tap_timeout_seconds() {
@@ -207,7 +217,7 @@ ensure_brew_package() {
   fi
 
   log_info "Installing ${package_name} for ${reason}..."
-  soft_run brew install "$package_name" || true
+  brew_install "$package_name" || true
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -372,10 +382,10 @@ phase_apps() {
         fi
       elif [[ "$line" == brew* ]]; then
         printf "  Installing formula: %s\\n" "$item"
-        soft_run brew install "$item" || true
+        brew_install "$item" || true
       elif [[ "$line" == cask* ]]; then
         printf "  Installing cask: %s\\n" "$item"
-        soft_run brew install --cask "$item" || true
+        brew_install --cask "$item" || true
       elif [[ "$line" == mas* ]]; then
         if [[ "$INSTALL_MAS" == "true" ]]; then
           local app_id; app_id="$(printf '%s' "$line" | grep -oE '[0-9]+' | head -n1)"

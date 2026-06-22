@@ -1086,7 +1086,7 @@ EOF
     ko "install.sh bounds slow brew tap duration" "elapsed ${elapsed}s despite BREW_TAP_TIMEOUT_SECONDS=1"
   fi
 
-  if grep -Fxq 'install git' "$brew_log"; then
+  if grep -Fxq 'install --no-ask git' "$brew_log"; then
     ok "install.sh keeps installing formulae after a slow tap"
   else
     ko "install.sh keeps installing formulae after a slow tap" "brew install git was skipped"
@@ -1159,10 +1159,10 @@ case "${1:-}" in
     exit 41
     ;;
   install)
-    if [[ "${2:-}" == "supabase" && -f "${TRUST_MARKER:?}" ]]; then
+    if [[ "${2:-}" == "--no-ask" && "${3:-}" == "supabase" && -f "${TRUST_MARKER:?}" ]]; then
       exit 0
     fi
-    if [[ "${2:-}" == "--cask" && "${3:-}" == "spotify" ]]; then
+    if [[ "${2:-}" == "--no-ask" && "${3:-}" == "--cask" && "${4:-}" == "spotify" ]]; then
       exit 0
     fi
     exit 42
@@ -1182,13 +1182,13 @@ EOF
     ko "install.sh trusts taps before installing tapped formulae" "install.sh aborted"
   fi
 
-  if grep -Fxq 'trust --tap supabase/tap' "$brew_log" && ! grep -Fq 'Command failed: brew install supabase' "$stderr_file"; then
+  if grep -Fxq 'trust --tap supabase/tap' "$brew_log" && ! grep -Fq 'Command failed: brew install --no-ask supabase' "$stderr_file"; then
     ok "tap trust prevents tapped formulae from being skipped"
   else
     ko "tap trust prevents tapped formulae from being skipped" "missing brew trust before formula install"
   fi
 
-  if grep -Fxq 'install --cask spotify' "$brew_log"; then
+  if grep -Fxq 'install --no-ask --cask spotify' "$brew_log"; then
     ok "install.sh still reaches casks after tapped formulae"
   else
     ko "install.sh still reaches casks after tapped formulae" "cask install was skipped"
@@ -1407,8 +1407,8 @@ EOF
   fi
 
   if grep -Fq '[dry-run] would run: brew tap alpha/tap' "$stdout_file" \
-    && grep -Fq '[dry-run] would run: brew install git' "$stdout_file" \
-    && grep -Fq '[dry-run] would run: brew install --cask karabiner-elements' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: brew install --no-ask git' "$stdout_file" \
+    && grep -Fq '[dry-run] would run: brew install --no-ask --cask karabiner-elements' "$stdout_file" \
     && grep -Fq '[dry-run] would run: npm install -g @biomejs/biome@2.4.12' "$stdout_file" \
     && grep -Fq 'Skipping MAS app: Auto Export (INSTALL_MAS=false)' "$stderr_file"; then
     ok "install.sh dry-run walks Brewfile and npm restore plan"
@@ -1554,7 +1554,7 @@ EOF
   fi
 
   if ! grep -Fq 'Phase 2: App Setup' "$stdout_file" \
-    && ! grep -Fq '[dry-run] would run: brew install git' "$stdout_file"; then
+    && ! grep -Fq '[dry-run] would run: brew install --no-ask git' "$stdout_file"; then
     ok "install.sh preflight stops before restore actions"
   else
     ko "install.sh preflight stops before restore actions" "restore actions ran after preflight failure"
@@ -1733,7 +1733,7 @@ EOF
     ko "soft package restore failures exit zero" "install.sh returned nonzero for brew install miss"
   fi
 
-  if grep -Fq 'Command failed: brew install git' "$soft_stderr" && grep -Fq 'warning(s)' "$soft_stdout"; then
+  if grep -Fq 'Command failed: brew install --no-ask git' "$soft_stderr" && grep -Fq 'warning(s)' "$soft_stdout"; then
     ok "soft package restore failures are summarized as warnings"
   else
     ko "soft package restore failures are summarized as warnings" "missing warning summary for package miss"
