@@ -46,7 +46,7 @@ soft_run() {
     printf "  [dry-run] would run: %s\\n" "$*"
     return 0
   fi
-  if "$@"; then
+  if "$@" </dev/null; then
     return 0
   else
     log_warn "Command failed: $*"
@@ -77,7 +77,7 @@ run_with_timeout() {
 
   if command -v timeout >/dev/null 2>&1; then
     set +e
-    timeout "$seconds" "$@"
+    timeout "$seconds" "$@" </dev/null
     local status=$?
     set -e
     return "$status"
@@ -85,7 +85,7 @@ run_with_timeout() {
 
   if command -v gtimeout >/dev/null 2>&1; then
     set +e
-    gtimeout "$seconds" "$@"
+    gtimeout "$seconds" "$@" </dev/null
     local status=$?
     set -e
     return "$status"
@@ -122,13 +122,13 @@ run_with_timeout() {
         }
         select undef, undef, undef, 0.1;
       }
-    ' "$seconds" "$@"
+    ' "$seconds" "$@" </dev/null
     local status=$?
     set -e
     return "$status"
   fi
 
-  "$@"
+  "$@" </dev/null
 }
 
 soft_run_brew_tap() {
@@ -371,7 +371,7 @@ phase_apps() {
   if [[ -f "$brewfile" ]]; then
     log_info "Installing from Brewfile..."
     # Install line-by-line for soft-fail and dry-run previews.
-    while IFS= read -r line || [[ -n "$line" ]]; do
+    while IFS= read -r line <&3 || [[ -n "$line" ]]; do
       line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
       [[ -z "$line" || "$line" == \#* ]] && continue
       local item; item="$(printf '%s' "$line" | sed 's/^[^"]*"\([^"]*\)".*/\1/')"
@@ -395,7 +395,7 @@ phase_apps() {
           log_warn "Skipping MAS app: $item (INSTALL_MAS=false)"
         fi
       fi
-    done < "$brewfile"
+    done 3< "$brewfile"
   fi
 
   # npm globals

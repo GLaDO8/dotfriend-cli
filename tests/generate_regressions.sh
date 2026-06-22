@@ -1417,6 +1417,88 @@ EOF
   fi
 }
 
+test_install_brewfile_loop_survives_brew_stdin_reads() {
+  setup_case "brewfile_stdin"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": ["Sample App|cask:sample-app|cask"],
+  "agents": [],
+  "formulae": ["node", "git"],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "brewfile-stdin", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/brewfile_stdin/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "brewfile stdin test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "brewfile stdin test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local fake_prefix="${TEST_DIR}/brewfile_stdin/fake-brew"
+  local bin_dir="${fake_prefix}/bin"
+  local brew_log="${TEST_DIR}/brewfile_stdin/brew.log"
+  mkdir -p "$bin_dir"
+
+  cat > "${bin_dir}/brew" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${BREW_LOG:?}"
+if [[ "${1:-}" == "shellenv" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == "install" && " $* " == *" node "* ]]; then
+  cat >/dev/null
+fi
+exit 0
+SH
+  chmod +x "${bin_dir}/brew"
+
+  cat > "${bin_dir}/sudo" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "${bin_dir}/sudo"
+
+  local install_home="${TEST_DIR}/brewfile_stdin/home-install"
+  mkdir -p "$install_home"
+  if HOME="$install_home" \
+    BACKUP_ROOT="${TEST_DIR}/brewfile_stdin/backup-root" \
+    DOTFRIEND_BREW_PREFIX="$fake_prefix" \
+    BREW_LOG="$brew_log" \
+    PATH="${bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin" \
+    INSTALL_DOTFRIEND=false \
+    BREW_UPGRADE=false \
+    INSTALL_MAS=false \
+    INSTALL_VALIDATE=false \
+    "$repo_dir/install.sh" >/dev/null 2>&1; then
+    ok "install.sh completes when brew reads stdin"
+  else
+    ko "install.sh completes when brew reads stdin" "install.sh failed"
+  fi
+
+  if grep -Fxq 'install --no-ask git' "$brew_log" \
+    && grep -Fxq 'install --no-ask --cask sample-app' "$brew_log"; then
+    ok "Brewfile restore continues after brew reads stdin"
+  else
+    ko "Brewfile restore continues after brew reads stdin" "later Brewfile entries were skipped"
+  fi
+}
+
 test_empty_filtered_config_dirs_do_not_break_cloned_restore_artifacts() {
   setup_case "empty_filtered_config"
   cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
@@ -1828,6 +1910,7 @@ test_install_times_out_slow_brew_taps_and_continues
 test_install_trusts_taps_before_formula_restore
 test_install_continues_when_brew_update_fails
 test_generated_restore_artifacts_are_portable_and_package_safe
+test_install_brewfile_loop_survives_brew_stdin_reads
 test_empty_filtered_config_dirs_do_not_break_cloned_restore_artifacts
 test_generated_validation_catches_restore_artifact_issues
 test_install_handles_sudo_copy_and_rsync_safely
