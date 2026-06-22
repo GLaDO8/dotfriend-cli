@@ -14,6 +14,7 @@ BREW_UPGRADE="{{BREW_UPGRADE:-true}}"
 INSTALL_DOTFRIEND="{{INSTALL_DOTFRIEND:-true}}"
 INSTALL_VALIDATE="{{INSTALL_VALIDATE:-false}}"
 BREW_TAP_TIMEOUT_SECONDS="${BREW_TAP_TIMEOUT_SECONDS:-120}"
+TRUST_BREW_TAPS="${TRUST_BREW_TAPS:-true}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOTFILES_DIR="${DOTFILES_DIR:-${SCRIPT_DIR}}"
 BACKUP_ROOT="${BACKUP_ROOT:-${HOME}/.dotfiles-backup}"
@@ -143,6 +144,21 @@ soft_run_brew_tap() {
     log_error "Command failed: brew tap ${tap}"
   fi
   return 1
+}
+
+soft_run_brew_trust_tap() {
+  local tap="$1"
+  if [[ "$TRUST_BREW_TAPS" != "true" || "$tap" == homebrew/* ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    soft_run brew trust --tap "$tap"
+    return 0
+  fi
+  if ! brew trust --help >/dev/null 2>&1; then
+    return 0
+  fi
+  soft_run brew trust --tap "$tap" || true
 }
 
 backup_file() {
@@ -351,7 +367,9 @@ phase_apps() {
       local item; item="$(printf '%s' "$line" | sed 's/^[^"]*"\([^"]*\)".*/\1/')"
       if [[ "$line" == tap* ]]; then
         printf "  Installing tap: %s\\n" "$item"
-        soft_run_brew_tap "$item" || true
+        if soft_run_brew_tap "$item"; then
+          soft_run_brew_trust_tap "$item" || true
+        fi
       elif [[ "$line" == brew* ]]; then
         printf "  Installing formula: %s\\n" "$item"
         soft_run brew install "$item" || true

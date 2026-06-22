@@ -939,6 +939,71 @@ EOF
   fi
 }
 
+test_validate_brew_parses_quoted_brewfile_entries() {
+  setup_case "validate_brew_quotes"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": ["Spotify|cask:spotify|cask"],
+  "agents": [],
+  "formulae": ["git"],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "validate-brew-quotes", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/validate_brew_quotes/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "validate brew quote test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "validate brew quote test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local fake_bin="${TEST_DIR}/validate_brew_quotes/bin"
+  local brew_log="${TEST_DIR}/validate_brew_quotes/brew.log"
+  local stdout_file="${TEST_DIR}/validate_brew_quotes/validate.stdout"
+  local stderr_file="${TEST_DIR}/validate_brew_quotes/validate.stderr"
+  mkdir -p "$fake_bin"
+
+  cat > "${fake_bin}/brew" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${BREW_LOG:?}"
+if [[ "${1:-}" == "list" && "${2:-}" == "--formula" && "${3:-}" == "git" ]]; then
+  exit 0
+fi
+if [[ "${1:-}" == "list" && "${2:-}" == "--cask" && "${3:-}" == "spotify" ]]; then
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "${fake_bin}/brew"
+
+  if BREW_LOG="$brew_log" PATH="${fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin" "${repo_dir}/scripts/validate.sh" --brew >"$stdout_file" 2>"$stderr_file"; then
+    ok "validate.sh accepts quoted Brewfile package names"
+  else
+    ko "validate.sh accepts quoted Brewfile package names" "quoted package names were treated as missing"
+  fi
+
+  if grep -Fxq 'list --formula git' "$brew_log" && grep -Fxq 'list --cask spotify' "$brew_log"; then
+    ok "validate.sh strips Brewfile quotes before brew list"
+  else
+    ko "validate.sh strips Brewfile quotes before brew list" "brew list saw quoted package names"
+  fi
+}
+
 test_install_times_out_slow_brew_taps_and_continues() {
   setup_case "install_brew_tap_timeout"
   cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
@@ -1031,6 +1096,102 @@ EOF
     ok "install.sh reports the timed-out brew tap"
   else
     ko "install.sh reports the timed-out brew tap" "missing timeout message"
+  fi
+}
+
+test_install_trusts_taps_before_formula_restore() {
+  setup_case "install_brew_tap_trust"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": ["Spotify|cask:spotify|cask"],
+  "agents": [],
+  "formulae": ["supabase"],
+  "taps": ["supabase/tap"],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": [],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "brew-tap-trust", "private": true}
+}
+EOF
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/install_brew_tap_trust/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "brew tap trust test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "brew tap trust test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local fake_prefix="${TEST_DIR}/install_brew_tap_trust/homebrew"
+  local fake_bin="${TEST_DIR}/install_brew_tap_trust/bin"
+  local dry_home="${TEST_DIR}/install_brew_tap_trust/new-home"
+  local brew_log="${TEST_DIR}/install_brew_tap_trust/brew.log"
+  local trust_marker="${TEST_DIR}/install_brew_tap_trust/trusted"
+  local stdout_file="${TEST_DIR}/install_brew_tap_trust/install.stdout"
+  local stderr_file="${TEST_DIR}/install_brew_tap_trust/install.stderr"
+  mkdir -p "${fake_prefix}/bin" "$fake_bin" "$dry_home"
+
+  cat > "${fake_prefix}/bin/brew" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${BREW_LOG:?}"
+case "${1:-}" in
+  shellenv|update|upgrade|tap)
+    exit 0
+    ;;
+  trust)
+    if [[ "${2:-}" == "--help" ]]; then
+      exit 0
+    fi
+    if [[ "${2:-}" == "--tap" && "${3:-}" == "supabase/tap" ]]; then
+      printf 'trusted\n' > "${TRUST_MARKER:?}"
+      exit 0
+    fi
+    exit 41
+    ;;
+  install)
+    if [[ "${2:-}" == "supabase" && -f "${TRUST_MARKER:?}" ]]; then
+      exit 0
+    fi
+    if [[ "${2:-}" == "--cask" && "${3:-}" == "spotify" ]]; then
+      exit 0
+    fi
+    exit 42
+    ;;
+esac
+exit 0
+EOF
+  cat > "${fake_bin}/sudo" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${fake_prefix}/bin/brew" "${fake_bin}/sudo"
+
+  if HOME="$dry_home" BREW_LOG="$brew_log" TRUST_MARKER="$trust_marker" DOTFRIEND_BREW_PREFIX="$fake_prefix" PATH="${fake_bin}:${fake_prefix}/bin:/usr/bin:/bin:/usr/sbin:/sbin" BREW_UPGRADE=false INSTALL_DOTFRIEND=false "$repo_dir/install.sh" >"$stdout_file" 2>"$stderr_file"; then
+    ok "install.sh trusts taps before installing tapped formulae"
+  else
+    ko "install.sh trusts taps before installing tapped formulae" "install.sh aborted"
+  fi
+
+  if grep -Fxq 'trust --tap supabase/tap' "$brew_log" && ! grep -Fq 'Command failed: brew install supabase' "$stderr_file"; then
+    ok "tap trust prevents tapped formulae from being skipped"
+  else
+    ko "tap trust prevents tapped formulae from being skipped" "missing brew trust before formula install"
+  fi
+
+  if grep -Fxq 'install --cask spotify' "$brew_log"; then
+    ok "install.sh still reaches casks after tapped formulae"
+  else
+    ko "install.sh still reaches casks after tapped formulae" "cask install was skipped"
   fi
 }
 
@@ -1540,17 +1701,18 @@ EOF
   fi
   GEN_NO_PUSH=false
 
+  local fake_prefix="${TEST_DIR}/install_exit_contract/homebrew"
   local fake_bin="${TEST_DIR}/install_exit_contract/bin"
   local soft_home="${TEST_DIR}/install_exit_contract/soft-home"
   local soft_stdout="${TEST_DIR}/install_exit_contract/soft.stdout"
   local soft_stderr="${TEST_DIR}/install_exit_contract/soft.stderr"
-  mkdir -p "$fake_bin" "$soft_home"
+  mkdir -p "${fake_prefix}/bin" "$fake_bin" "$soft_home"
 
   cat > "${fake_bin}/sudo" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-  cat > "${fake_bin}/brew" <<'EOF'
+  cat > "${fake_prefix}/bin/brew" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
@@ -1563,9 +1725,9 @@ case "${1:-}" in
 esac
 exit 0
 EOF
-  chmod +x "${fake_bin}/sudo" "${fake_bin}/brew"
+  chmod +x "${fake_bin}/sudo" "${fake_prefix}/bin/brew"
 
-  if HOME="$soft_home" PATH="${fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin" BREW_UPGRADE=false INSTALL_DOTFRIEND=false "$repo_dir/install.sh" >"$soft_stdout" 2>"$soft_stderr"; then
+  if HOME="$soft_home" DOTFRIEND_BREW_PREFIX="$fake_prefix" PATH="${fake_bin}:${fake_prefix}/bin:/usr/bin:/bin:/usr/sbin:/sbin" BREW_UPGRADE=false INSTALL_DOTFRIEND=false "$repo_dir/install.sh" >"$soft_stdout" 2>"$soft_stderr"; then
     ok "soft package restore failures exit zero"
   else
     ko "soft package restore failures exit zero" "install.sh returned nonzero for brew install miss"
@@ -1661,7 +1823,9 @@ test_generator_code_changes_invalidate_generated_install_script
 test_macos_defaults_generation_and_apply_script
 test_install_dry_run_plans_restore_dependencies_without_missing_tool_warnings
 test_brewfile_entries_use_real_newlines
+test_validate_brew_parses_quoted_brewfile_entries
 test_install_times_out_slow_brew_taps_and_continues
+test_install_trusts_taps_before_formula_restore
 test_install_continues_when_brew_update_fails
 test_generated_restore_artifacts_are_portable_and_package_safe
 test_empty_filtered_config_dirs_do_not_break_cloned_restore_artifacts
