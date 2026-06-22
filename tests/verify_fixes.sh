@@ -2,7 +2,7 @@
 # Verification script for dotfriend fixes
 set -euo pipefail
 
-PROJECT="/Users/shreyasgupta/local-documents/dotfriend"
+PROJECT="${PROJECT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 TEST_DIR="$(mktemp -d)"
 export HOME="$TEST_DIR"
 export DOTFRIEND_CACHE_DIR="${HOME}/.cache/dotfriend"

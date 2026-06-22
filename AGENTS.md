@@ -2,6 +2,8 @@
 
 Agent handoff for this repo. Keep this file focused on implementation guidance, not product docs. For user-facing overview, commands, and installation, see `README.md`.
 
+When making considerable user-facing or workflow changes, update `README.md` in the same change.
+
 ## High-Value Files
 
 | File | Purpose |
@@ -12,6 +14,7 @@ Agent handoff for this repo. Keep this file focused on implementation guidance, 
 | `lib/wizard.sh` | Interactive `dotfriend start` flow. Writes selections to cache. |
 | `lib/discovery.sh` | Scans machine state and writes discovery cache. |
 | `lib/generate.sh` | Builds the output dotfiles repo from cached selections. |
+| `lib/macos_preferences.sh` | macOS preference category registry and backup/export helpers. |
 | `lib/sync.sh` | Syncs machine changes back into an existing generated repo. |
 | `lib/gum.sh` | Gum wrappers plus plain-bash fallbacks used in tests. |
 | `templates/install.sh` | Generated restore/install script. |
@@ -43,6 +46,7 @@ Agent handoff for this repo. Keep this file focused on implementation guidance, 
 - When reading JSON arrays for shell loops, extract scalars, not objects.
 - Discovery cache: `~/.cache/dotfriend/discovery.json`
 - Selections cache: `~/.cache/dotfriend/selections.json`
+- macOS preference selections live at `.macos_preferences.categories`; category IDs come from `lib/macos_preferences.sh`.
 
 ### Generated Script Behavior
 - Generated restore scripts should soft-fail where practical. One bad brew formula, npm package, or dock command should not abort the whole restore.
@@ -66,6 +70,7 @@ Agent handoff for this repo. Keep this file focused on implementation guidance, 
 | Change runtime bootstrapping | `lib/bootstrap.sh` |
 | Add or modify wizard steps | `lib/wizard.sh` |
 | Change discovery behavior | `lib/discovery.sh`, `lib/cask-map.json`, `lib/agent-tools.json` |
+| Change macOS preference backup/restore | `lib/macos_preferences.sh`, `lib/wizard.sh`, `lib/generate.sh`, `templates/install.sh` |
 | Change generated repo contents | `lib/generate.sh`, `templates/` |
 | Change sync behavior | `lib/sync.sh` |
 | Change Gum wrappers or TUI behavior | `lib/gum.sh` |

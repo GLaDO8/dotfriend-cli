@@ -11,9 +11,7 @@
     "lib/",
     "templates/",
     "bin/",
-    "AGENTS.md",
-    "PLAN.md",
-    "TEST_REPORT.md"
+    "AGENTS.md"
   ],
   "engines": {
     "node": ">=14"

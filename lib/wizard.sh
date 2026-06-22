@@ -15,6 +15,8 @@ source "$SCRIPT_DIR/common.sh"
 source "$SCRIPT_DIR/gum.sh"
 # shellcheck source=discovery.sh
 source "$SCRIPT_DIR/discovery.sh"
+# shellcheck source=macos_preferences.sh
+source "$SCRIPT_DIR/macos_preferences.sh"
 
 # ─────────────────────────────────────────────────────────────
 # Globals
@@ -30,6 +32,7 @@ SELECTED_FORMULAE=()
 SELECTED_TAPS=()
 SELECTED_NPM=()
 SELECTED_DOTFILES=()
+SELECTED_MACOS_PREFERENCES=()
 
 # Editor selections
 EDITOR_VSCODE=false
@@ -38,6 +41,7 @@ EDITOR_CURSOR=false
 # Other selections
 DOCK_BACKUP=false
 DOCK_DEFAULTS=false
+MACOS_PREFERENCES_BACKUP=false
 XCODE=false
 TELEMETRY=false
 GITHUB_REPO="dotfiles"
@@ -50,7 +54,7 @@ GITHUB_PRIVATE=true
 _require_wizard_runtime() {
   local cmd
 
-  for cmd in jq gum gh mas npm; do
+  for cmd in jq gum gh mas duti npm; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       log_error "dotfriend bootstrap should have installed '$cmd', but it is still missing."
       exit 1
@@ -162,6 +166,19 @@ _write_selections_json() {
   local dock_defaults_str="false"
   [[ "$DOCK_DEFAULTS" == true ]] && dock_defaults_str="true"
   json+='"dock":{"backup":'"$dock_backup_str"',"defaults":'"$dock_defaults_str"'},'
+
+  # macOS preferences
+  local macos_backup_str="false"
+  [[ "$MACOS_PREFERENCES_BACKUP" == true ]] && macos_backup_str="true"
+  json+='"macos_preferences":{"backup":'"$macos_backup_str"',"categories":['
+  first=true
+  for item in "${SELECTED_MACOS_PREFERENCES[@]}"; do
+    [[ -z "$item" ]] && continue
+    [[ "$first" == true ]] || json+=","
+    first=false
+    json+="\"$(json_escape "$item")\""
+  done
+  json+=']},'
 
   # xcode
   local xcode_str="false"
@@ -658,27 +675,93 @@ _step7_editors() {
 }
 
 # ─────────────────────────────────────────────────────────────
-### Step 8: Dock & Default Apps
+### Step 8: Dock
 # ─────────────────────────────────────────────────────────────
 
 _step8_dock() {
-  log_step "Step 8: Dock & Default Apps"
+  log_step "Step 8: Dock"
 
   if gum_confirm --prompt "Back up current Dock layout?"; then
     DOCK_BACKUP=true
   fi
+}
 
-  if gum_confirm --prompt "Set default app associations on restore (requires duti)?"; then
-    DOCK_DEFAULTS=true
+# ─────────────────────────────────────────────────────────────
+### Step 9: macOS Defaults
+# ─────────────────────────────────────────────────────────────
+
+_step9_macos_defaults() {
+  log_step "Step 9: macOS Defaults"
+
+  gum_style --foreground 240 \
+    "Recommended backs up every dotfriend-supported macOS category: Finder, Dock settings, keyboard shortcuts, input devices, menu bar, screenshots, accessibility, default apps, Apple app preferences, and system reports for network, power, security, printing, and Time Machine. It skips cloud-backed text replacements, fonts, third-party app preferences, and credential-adjacent Passwords preferences."
+
+  local choice
+  choice="$(gum_choose \
+    --header "Choose how to back up macOS settings:" \
+    "Backup recommended settings" \
+    "Custom backup settings" \
+    "Skip macOS settings")"
+
+  SELECTED_MACOS_PREFERENCES=()
+  MACOS_PREFERENCES_BACKUP=false
+
+  if [[ "$choice" == "Skip macOS settings" || -z "$choice" ]]; then
+    return 0
+  fi
+
+  MACOS_PREFERENCES_BACKUP=true
+
+  if [[ "$choice" == "Backup recommended settings" ]]; then
+    while IFS= read -r id; do
+      [[ -n "$id" ]] && SELECTED_MACOS_PREFERENCES+=("$id")
+    done < <(macos_recommended_preference_category_ids)
+    return 0
+  fi
+
+  local -a labels=()
+  local -a ids=()
+  local id label
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    label="$(macos_preference_category_label "$id")"
+    ids+=("$id")
+    labels+=("$label")
+  done < <(macos_preference_category_ids)
+
+  local -a choose_args=(--no-limit --header "Select macOS settings to back up:")
+  for label in "${labels[@]}"; do
+    choose_args+=(--selected "${label//,/\\,}")
+  done
+  choose_args+=("${labels[@]}")
+
+  local -a selected=()
+  while IFS= read -r line; do
+    selected+=("$line")
+  done < <(gum_choose "${choose_args[@]}")
+
+  local selected_label
+  for selected_label in "${selected[@]}"; do
+    local i
+    for i in "${!labels[@]}"; do
+      if [[ "${labels[$i]}" == "$selected_label" ]]; then
+        SELECTED_MACOS_PREFERENCES+=("${ids[$i]}")
+        break
+      fi
+    done
+  done
+
+  if [[ ${#SELECTED_MACOS_PREFERENCES[@]} -eq 0 ]]; then
+    MACOS_PREFERENCES_BACKUP=false
   fi
 }
 
 # ─────────────────────────────────────────────────────────────
-### Step 9: Xcode Command Line Tools
+### Step 10: Xcode Command Line Tools
 # ─────────────────────────────────────────────────────────────
 
-_step9_xcode() {
-  log_step "Step 9: Xcode Command Line Tools"
+_step10_xcode() {
+  log_step "Step 10: Xcode Command Line Tools"
 
   gum_style --foreground 240 \
     "These tools are required for Homebrew, Git, and many developer tools. Recommended for all users."
@@ -689,11 +772,11 @@ _step9_xcode() {
 }
 
 # ─────────────────────────────────────────────────────────────
-### Step 10: Telemetry & Analytics
+### Step 11: Telemetry & Analytics
 # ─────────────────────────────────────────────────────────────
 
-_step10_telemetry() {
-  log_step "Step 10: Telemetry & Analytics"
+_step11_telemetry() {
+  log_step "Step 11: Telemetry & Analytics"
 
   gum_style --foreground 240 \
     "Disable data collection for Homebrew, Go, GitHub CLI, Bun, npm, pnpm, and Deno. Recommended for privacy."
@@ -704,11 +787,11 @@ _step10_telemetry() {
 }
 
 # ─────────────────────────────────────────────────────────────
-### Step 11: Generate Repository
+### Step 12: Generate Repository
 # ─────────────────────────────────────────────────────────────
 
-_step11_collect() {
-  log_step "Step 11: Prepare Repository Generation"
+_step12_collect() {
+  log_step "Step 12: Prepare Repository Generation"
 
   _write_selections_json "$SELECTIONS_FILE"
 
@@ -724,16 +807,17 @@ _step11_collect() {
   log_info "VS Code:   $EDITOR_VSCODE"
   log_info "Cursor:    $EDITOR_CURSOR"
   log_info "Dock:      backup=$DOCK_BACKUP, defaults=$DOCK_DEFAULTS"
+  log_info "macOS:     backup=$MACOS_PREFERENCES_BACKUP (${#SELECTED_MACOS_PREFERENCES[@]} categories)"
   log_info "Xcode CLI: $XCODE"
   log_info "Telemetry: $TELEMETRY"
 }
 
 # ─────────────────────────────────────────────────────────────
-### Step 12: GitHub Backup
+### Step 13: GitHub Backup
 # ─────────────────────────────────────────────────────────────
 
-_step12_github() {
-  log_step "Step 12: GitHub Backup"
+_step13_github() {
+  log_step "Step 13: GitHub Backup"
 
   if command -v gh >/dev/null 2>&1; then
     if gh auth status >/dev/null 2>&1; then
@@ -778,10 +862,12 @@ wizard_start() {
   SELECTED_TAPS=()
   SELECTED_NPM=()
   SELECTED_DOTFILES=()
+  SELECTED_MACOS_PREFERENCES=()
   EDITOR_VSCODE=false
   EDITOR_CURSOR=false
   DOCK_BACKUP=false
   DOCK_DEFAULTS=false
+  MACOS_PREFERENCES_BACKUP=false
   XCODE=false
   TELEMETRY=false
   GITHUB_REPO="dotfiles"
@@ -796,10 +882,11 @@ wizard_start() {
   _step6_dotfiles
   _step7_editors
   _step8_dock
-  _step9_xcode
-  _step10_telemetry
-  _step11_collect
-  _step12_github
+  _step9_macos_defaults
+  _step10_xcode
+  _step11_telemetry
+  _step12_collect
+  _step13_github
 
   log_ok "Wizard complete!"
   gum_style --foreground 240 "Your selections are ready for code generation."

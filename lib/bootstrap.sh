@@ -13,6 +13,7 @@ DOTFRIEND_RUNTIME_FORMULAE=(
   gum
   gh
   mas
+  duti
   node
 )
 
@@ -111,7 +112,7 @@ verify_runtime_dependencies() {
   local cmd
 
   require_bootstrap_command "brew"
-  for cmd in git jq gum gh mas npm; do
+  for cmd in git jq gum gh mas duti npm; do
     require_bootstrap_command "$cmd"
   done
 }

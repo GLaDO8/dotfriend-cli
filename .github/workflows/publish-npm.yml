@@ -2,9 +2,8 @@ name: Publish Package to npmjs
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -17,12 +16,27 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Check tag matches package version
+        shell: bash
+        run: |
+          current_version="$(node -p "require('./package.json').version")"
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          if [[ "$tag_version" != "$current_version" ]]; then
+            echo "Release tag v${tag_version} does not match package.json version ${current_version}." >&2
+            exit 1
+          fi
+
+          echo "Publishing package.json version ${current_version} from tag ${GITHUB_REF_NAME}."
 
       - name: Check package contents
         run: npm pack --dry-run
