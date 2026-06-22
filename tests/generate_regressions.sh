@@ -1256,6 +1256,67 @@ EOF
   fi
 }
 
+test_empty_filtered_config_dirs_do_not_break_cloned_restore_artifacts() {
+  setup_case "empty_filtered_config"
+  cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
+{
+  "apps": [],
+  "agents": [],
+  "formulae": [],
+  "taps": [],
+  "npm_globals": [],
+  "dotfiles": [],
+  "config_dirs": ["raycast"],
+  "editors": {"vscode": false, "cursor": false},
+  "dock": {"backup": false, "defaults": false},
+  "xcode": false,
+  "telemetry": false,
+  "github": {"repo_name": "empty-filtered-config", "private": true}
+}
+EOF
+  mkdir -p "${HOME}/.config/raycast/extensions" "${HOME}/.config/raycast/ai"
+
+  source_generator
+
+  local repo_dir="${TEST_DIR}/empty_filtered_config/out"
+  GEN_NO_PUSH=true
+  if generate_repo "$repo_dir" false >/dev/null 2>&1; then
+    ok "empty filtered config test repo generates"
+  else
+    GEN_NO_PUSH=false
+    ko "empty filtered config test repo generates" "generate_repo failed"
+    return
+  fi
+  GEN_NO_PUSH=false
+
+  local missing_tracked_source=""
+  while IFS= read -r repo_path; do
+    [[ -n "$repo_path" ]] || continue
+    if [[ -e "${repo_dir}/${repo_path}" ]] && ! git -C "$repo_dir" ls-files -- "$repo_path" | grep -q .; then
+      missing_tracked_source="$repo_path"
+      break
+    fi
+  done < <(jq -r '
+    .items[]?
+    | select(.selected != false)
+    | select(.restore_mode | IN("symlink","copy","rsync","managed_json_merge","managed_markdown_block","defaults_import"))
+    | .repo_path // empty
+  ' "${repo_dir}/.dotfriend/restore-manifest.json")
+
+  if [[ -z "$missing_tracked_source" ]]; then
+    ok "restore manifest sources are tracked by git"
+  else
+    ko "restore manifest sources are tracked by git" "untracked source path: ${missing_tracked_source}"
+  fi
+
+  if ! jq -e '.items[]? | select(.repo_path == "config/raycast")' "${repo_dir}/.dotfriend/restore-manifest.json" >/dev/null \
+    && ! grep -Fq 'config/raycast' "${repo_dir}/install.sh"; then
+    ok "empty filtered config dirs are not emitted as restore sources"
+  else
+    ko "empty filtered config dirs are not emitted as restore sources" "manifest or install.sh still references config/raycast"
+  fi
+}
+
 test_generated_validation_catches_restore_artifact_issues() {
   setup_case "restore_validation"
   cat > "${DOTFRIEND_CACHE_DIR}/selections.json" <<'EOF'
@@ -1603,6 +1664,7 @@ test_brewfile_entries_use_real_newlines
 test_install_times_out_slow_brew_taps_and_continues
 test_install_continues_when_brew_update_fails
 test_generated_restore_artifacts_are_portable_and_package_safe
+test_empty_filtered_config_dirs_do_not_break_cloned_restore_artifacts
 test_generated_validation_catches_restore_artifact_issues
 test_install_handles_sudo_copy_and_rsync_safely
 test_install_exit_status_contract

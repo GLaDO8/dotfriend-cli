@@ -207,6 +207,16 @@ _copy_tree_filtered() {
   dotfriend_remove_pruned_paths "$dest" "$filter_profile"
 }
 
+_dir_has_filtered_files() {
+  local root="$1" filter_profile="${2:-config}" found=false file_path
+  [[ -d "$root" ]] || return 1
+  while IFS= read -r -d '' file_path; do
+    found=true
+    break
+  done < <(dotfriend_find_files_filtered "$root" "$filter_profile")
+  [[ "$found" == "true" ]]
+}
+
 _sanitize_agent_file_copy() {
   local agent_id="$1" dest="$2"
 
@@ -854,6 +864,7 @@ _build_copies_block() {
   if [[ -n "$configs" ]]; then
     while IFS= read -r cfg; do
       [[ -z "$cfg" ]] && continue
+      _dir_has_filtered_files "${HOME}/.config/${cfg}" "config" || continue
       printf '  _copy "$DOTFILES_DIR/config/%s" "$HOME/.config/%s"\n' "$cfg" "$cfg"
     done <<< "$configs"
   fi
@@ -892,11 +903,15 @@ _build_agent_rsync_block() {
     fi
   done < <(_selected_agent_ids)
 
-  if [[ -d "${GEN_DIR}/agents/skills" ]]; then
-    printf '  _rsync_agent "$DOTFILES_DIR/agents/skills" "$HOME/.agents/skills"\n'
+  if _dir_has_filtered_files "${HOME}/.agents/skills" "agent"; then
+    printf '  if [[ -d "$DOTFILES_DIR/agents/skills" ]]; then\n'
+    printf '    _rsync_agent "$DOTFILES_DIR/agents/skills" "$HOME/.agents/skills"\n'
+    printf "  fi\n"
   fi
-  if [[ -d "${GEN_DIR}/agents/agent-docs" ]]; then
-    printf '  _rsync_agent "$DOTFILES_DIR/agents/agent-docs" "$HOME/.agents/agent-docs"\n'
+  if _dir_has_filtered_files "${HOME}/.agents/agent-docs" "agent"; then
+    printf '  if [[ -d "$DOTFILES_DIR/agents/agent-docs" ]]; then\n'
+    printf '    _rsync_agent "$DOTFILES_DIR/agents/agent-docs" "$HOME/.agents/agent-docs"\n'
+    printf "  fi\n"
   fi
 }
 
@@ -1060,6 +1075,10 @@ _copy_configs() {
       local src="${HOME}/.config/${cfg}"
       local dest="${GEN_DIR}/config/${cfg}"
       if [[ -d "$src" ]]; then
+        if ! _dir_has_filtered_files "$src" "config"; then
+          log_info "Skipped ~/.config/${cfg}; no restorable files after filters"
+          continue
+        fi
         _copy_tree_filtered "$src" "$dest"
         log_ok "Copied ~/.config/${cfg}"
       fi

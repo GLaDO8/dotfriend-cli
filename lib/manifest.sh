@@ -48,6 +48,24 @@ manifest_validate() {
   ' "$manifest_file" >/dev/null
 }
 
+manifest_repo_path_has_files() {
+  local path="$1"
+  [[ -d "$path" ]] || return 1
+  [[ -n "$(find "$path" -type f -print -quit 2>/dev/null)" ]]
+}
+
+manifest_dotfile_repo_path() {
+  local dotfile="$1"
+  case "$dotfile" in
+    .gitconfig)
+      printf '%s' "config/git/${dotfile}"
+      ;;
+    *)
+      printf '%s' "zsh/${dotfile}"
+      ;;
+  esac
+}
+
 manifest_write_for_generated_repo() {
   local repo_dir="$1" selections_file="$2" agent_tools_file="$3"
   local out="${repo_dir}/.dotfriend/restore-manifest.json"
@@ -61,11 +79,54 @@ manifest_write_for_generated_repo() {
 
   local tmp
   tmp="$(mktemp)"
+  local generated_dotfiles generated_config_dirs generated_agents
+  local generated_dotfiles_json generated_config_dirs_json generated_agents_json
+  local include_agent_skills=false include_agent_docs=false
+  generated_dotfiles="$(mktemp)"
+  generated_config_dirs="$(mktemp)"
+  generated_agents="$(mktemp)"
+
+  while IFS= read -r dotfile; do
+    [[ -n "$dotfile" ]] || continue
+    if [[ -f "${repo_dir}/$(manifest_dotfile_repo_path "$dotfile")" ]]; then
+      printf '%s\n' "$dotfile" >> "$generated_dotfiles"
+    fi
+  done < <(jq -r '.dotfiles[]?' "$selections_file" 2>/dev/null || true)
+
+  while IFS= read -r config_dir; do
+    [[ -n "$config_dir" ]] || continue
+    if manifest_repo_path_has_files "${repo_dir}/config/${config_dir}"; then
+      printf '%s\n' "$config_dir" >> "$generated_config_dirs"
+    fi
+  done < <(jq -r '.config_dirs[]?' "$selections_file" 2>/dev/null || true)
+
+  while IFS= read -r agent_id; do
+    [[ -n "$agent_id" ]] || continue
+    if manifest_repo_path_has_files "${repo_dir}/${agent_id}"; then
+      printf '%s\n' "$agent_id" >> "$generated_agents"
+    fi
+  done < <(jq -r '.agents[]? | if type == "object" then (.id // empty) else . end' "$selections_file" 2>/dev/null || true)
+
+  if manifest_repo_path_has_files "${repo_dir}/agents/skills"; then
+    include_agent_skills=true
+  fi
+  if manifest_repo_path_has_files "${repo_dir}/agents/agent-docs"; then
+    include_agent_docs=true
+  fi
+
+  generated_dotfiles_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$generated_dotfiles")"
+  generated_config_dirs_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$generated_config_dirs")"
+  generated_agents_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' "$generated_agents")"
 
   jq -n \
     --arg generated_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
     --arg hostname "$(hostname 2>/dev/null || printf '')" \
     --arg os "$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' || printf unknown)" \
+    --argjson generated_dotfiles "$generated_dotfiles_json" \
+    --argjson generated_config_dirs "$generated_config_dirs_json" \
+    --argjson generated_agents "$generated_agents_json" \
+    --argjson include_agent_skills "$include_agent_skills" \
+    --argjson include_agent_docs "$include_agent_docs" \
     --slurpfile selections_file "$selections_file" \
     --slurpfile agent_tools_file "$agent_tools_file" \
     '
@@ -76,7 +137,7 @@ manifest_write_for_generated_repo() {
       if $path == ".gitconfig" then "config/git/.gitconfig" else "zsh/" + $path end;
 
     def selected_dotfiles:
-      ($selections.dotfiles // [])
+      $generated_dotfiles
       | map({
           id: ("dotfile:" + (sub("^\\."; ""))),
           type: "dotfile",
@@ -88,7 +149,7 @@ manifest_write_for_generated_repo() {
         });
 
     def selected_config_dirs:
-      ($selections.config_dirs // [])
+      $generated_config_dirs
       | map({
           id: ("config_dir:" + .),
           type: "config_dir",
@@ -100,8 +161,8 @@ manifest_write_for_generated_repo() {
         });
 
     def selected_agents:
-      ($selections.agents // [])
-      | map(.id as $id
+      $generated_agents
+      | map(. as $id
         | ($agent_tools.agentic_tools[]? | select(.id == $id)) as $tool
         | {
             id: ("agent_config:" + $id),
@@ -199,7 +260,7 @@ manifest_write_for_generated_repo() {
         + editor_extensions
         + selected_macos_defaults
         + package_artifacts
-        + [
+        + (if $include_agent_skills then [
           {
             id: "agent_shared_store:skills",
             type: "agent_shared_store",
@@ -208,7 +269,9 @@ manifest_write_for_generated_repo() {
             target_path: "~/.agents/skills",
             selected: true,
             requires_approval: false
-          },
+          }
+        ] else [] end)
+        + (if $include_agent_docs then [
           {
             id: "agent_shared_store:agent-docs",
             type: "agent_shared_store",
@@ -218,12 +281,13 @@ manifest_write_for_generated_repo() {
             selected: true,
             requires_approval: false
           }
-        ]
+        ] else [] end)
       ),
       manual_followups: []
     }
     ' > "$tmp"
 
+  rm -f "$generated_dotfiles" "$generated_config_dirs" "$generated_agents"
   mv "$tmp" "$out"
   manifest_validate "$out"
 }
